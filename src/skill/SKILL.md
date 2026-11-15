@@ -38,4 +38,10 @@ gdrive budget --max-mb 250 --min-free-gb 15 --threshold 3 --json
 
 # Install or update the Omarchy top-bar sync status widget plugin (ben.gdrive)
 gdrive plugin install --json
+
+# Enable or inspect automatic startup on reboot and wake from standby
+gdrive autostart enable --json
+
+# Run background daemon (mounts ~/Drive, syncs periodically, and syncs on standby wake)
+gdrive daemon --once --json
 ```

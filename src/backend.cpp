@@ -457,7 +457,7 @@ QString Backend::localBlobPath(const QString &relPath) const {
 }
 
 bool Backend::fetchFromRcloneLocked(const DriveFileEntry &entry, const QString &destBlobPath, QString *errorOut) const {
-    if (!m_rcloneAvailable || m_remoteName.isEmpty())
+    if (!m_rcloneAvailable || m_remoteName.isEmpty() || !m_availableRemotes.contains(m_remoteName))
         return false;
 
     QString remoteSpec = m_remoteName;
@@ -476,8 +476,15 @@ bool Backend::fetchFromRcloneLocked(const DriveFileEntry &entry, const QString &
 
     QDir().mkpath(QFileInfo(destBlobPath).absolutePath());
     QProcess proc;
-    proc.start(m_rcloneBin, {"copyto", remoteSpec, destBlobPath});
-    if (!proc.waitForFinished(30000) || proc.exitCode() != 0) {
+    proc.start(m_rcloneBin, {"copyto", "--contimeout=3s", "--timeout=5s", "--retries=1", remoteSpec, destBlobPath});
+    if (!proc.waitForFinished(5000)) {
+        proc.kill();
+        proc.waitForFinished(500);
+        if (errorOut)
+            *errorOut = tr("Timed out connecting to rclone remote '%1:'").arg(m_remoteName);
+        return false;
+    }
+    if (proc.exitCode() != 0) {
         if (errorOut)
             *errorOut = QString::fromUtf8(proc.readAllStandardError()).trimmed();
         return false;
@@ -1479,7 +1486,7 @@ void Backend::syncNow() {
     m_syncing = true;
     emit statusChanged();
 
-    if (m_sourceMode == QLatin1String("rclone") && m_rcloneAvailable) {
+    if (m_sourceMode == QLatin1String("rclone") && m_rcloneAvailable && m_availableRemotes.contains(m_remoteName)) {
         QString spec = m_remoteName;
         if (!spec.endsWith(':'))
             spec += ':';
@@ -1487,8 +1494,13 @@ void Backend::syncNow() {
             spec += m_remotePath;
 
         QProcess proc;
-        proc.start(m_rcloneBin, {"lsjson", "-R", "--files-only", spec});
-        if (proc.waitForFinished(30000) && proc.exitCode() == 0) {
+        proc.start(m_rcloneBin, {"lsjson", "-R", "--files-only", "--contimeout=3s", "--timeout=5s", "--retries=1", spec});
+        const bool finished = proc.waitForFinished(5000);
+        if (!finished) {
+            proc.kill();
+            proc.waitForFinished(500);
+        }
+        if (finished && proc.exitCode() == 0) {
             const QJsonArray arr = QJsonDocument::fromJson(proc.readAllStandardOutput()).array();
             QMutexLocker locker(&m_mutex);
             QHash<QString, DriveFileEntry> existingByPath;

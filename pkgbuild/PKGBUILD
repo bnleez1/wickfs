@@ -21,4 +21,5 @@ package() {
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
   install -Dm644 "$startdir/gdrive.svg" "$pkgdir/usr/share/icons/hicolor/scalable/apps/gdrive.svg"
   install -Dm644 "$startdir/gdrive.desktop" "$pkgdir/usr/share/applications/gdrive.desktop"
+  install -Dm644 "$startdir/gdrive.service" "$pkgdir/usr/lib/systemd/user/gdrive.service"
 }
