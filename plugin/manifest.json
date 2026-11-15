@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "id": "ben.gdrive",
+  "name": "GDrive Sync",
+  "version": "0.1.0",
+  "author": "ben",
+  "license": "MIT",
+  "description": "Live Google Drive sync status, on-demand hydration progress, and LFU/LRU disk cache widget for the Omarchy bar.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "GDrive Sync",
+    "description": "Shows when Google Drive files are syncing or in sync, with smart LFU/LRU cache usage and quick controls.",
+    "category": "Storage",
+    "defaultSection": "right",
+    "allowMultiple": false,
+    "defaults": {
+      "intervalMs": 1500
+    },
+    "schema": [
+      {
+        "key": "intervalMs",
+        "type": "integer",
+        "label": "Refresh interval (ms)",
+        "min": 500,
+        "max": 10000,
+        "step": 250,
+        "defaultValue": 1500
+      }
+    ]
+  }
+}

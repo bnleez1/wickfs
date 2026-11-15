@@ -107,6 +107,17 @@ class Backend : public QObject {
     Q_PROPERTY(QString statusBannerText READ statusBannerText NOTIFY statusChanged)
     Q_PROPERTY(bool statusBannerIsError READ statusBannerIsError NOTIFY statusChanged)
     Q_PROPERTY(bool syncing READ syncing NOTIFY statusChanged)
+    Q_PROPERTY(QString syncState READ syncState NOTIFY statusChanged)
+    Q_PROPERTY(QString syncStateLabel READ syncStateLabel NOTIFY statusChanged)
+    Q_PROPERTY(QString syncDetailText READ syncDetailText NOTIFY statusChanged)
+    Q_PROPERTY(QString activeSyncFile READ activeSyncFile NOTIFY statusChanged)
+    Q_PROPERTY(double syncProgress READ syncProgress NOTIFY statusChanged)
+    Q_PROPERTY(QString lastSyncedFormatted READ lastSyncedFormatted NOTIFY statusChanged)
+    Q_PROPERTY(int pendingSyncCount READ pendingSyncCount NOTIFY statusChanged)
+    Q_PROPERTY(int syncedFileCount READ syncedFileCount NOTIFY statsChanged)
+    Q_PROPERTY(bool autoStartEnabled READ autoStartEnabled NOTIFY statusChanged)
+    Q_PROPERTY(QString autoStartSummary READ autoStartSummary NOTIFY statusChanged)
+    Q_PROPERTY(int wakeSyncCount READ wakeSyncCount NOTIFY statusChanged)
 
     Q_PROPERTY(qint64 totalCloudBytes READ totalCloudBytes NOTIFY statsChanged)
     Q_PROPERTY(qint64 cachedBytes READ cachedBytes NOTIFY statsChanged)
@@ -187,6 +198,23 @@ public:
     QString statusBannerText() const { return m_statusBannerText; }
     bool statusBannerIsError() const { return m_statusBannerIsError; }
     bool syncing() const { return m_syncing; }
+    QString syncState() const;
+    QString syncStateLabel() const;
+    QString syncDetailText() const;
+    QString activeSyncFile() const { return m_activeSyncFile; }
+    double syncProgress() const { return m_syncProgress; }
+    QString lastSyncedFormatted() const;
+    int pendingSyncCount() const { return m_pendingSyncCount; }
+    int syncedFileCount() const;
+    bool autoStartEnabled() const;
+    QString autoStartSummary() const;
+    int wakeSyncCount() const { return m_wakeSyncCount; }
+
+    Q_INVOKABLE void beginSyncSimulation(const QString &fileName = {}, int totalFiles = 1);
+    Q_INVOKABLE void finishSyncSimulation();
+
+public slots:
+    void handleSystemWake(bool sleeping = false);
 
     qint64 totalCloudBytes() const;
     qint64 cachedBytes() const;
@@ -342,6 +370,12 @@ private:
     QString m_statusBannerText;
     bool m_statusBannerIsError = false;
     bool m_syncing = false;
+    QString m_activeSyncFile;
+    double m_syncProgress = 1.0;
+    qint64 m_lastSyncedSecs = 0;
+    int m_pendingSyncCount = 0;
+    int m_wakeSyncCount = 0;
+    QTimer m_syncAnimTimer;
 
     qint64 m_maxCacheBytes = 250LL * 1024LL * 1024LL;        // Default 250 MB smart cache ceiling
     qint64 m_minFreeDiskBytes = 2LL * 1024LL * 1024LL * 1024LL; // Default 2 GB free space floor

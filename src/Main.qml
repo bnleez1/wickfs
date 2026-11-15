@@ -106,6 +106,12 @@ ApplicationWindow {
         onActivated: backend.syncNow()
     }
     Shortcut {
+        sequence: "S"
+        context: Qt.ApplicationShortcut
+        enabled: !searchField.activeFocus
+        onActivated: syncStatusPanel.visible ? syncStatusPanel.close() : syncStatusPanel.open()
+    }
+    Shortcut {
         sequence: "B"
         context: Qt.ApplicationShortcut
         enabled: !searchField.activeFocus
@@ -291,6 +297,80 @@ ApplicationWindow {
                             anchors.fill: parent
                             cursorShape: Qt.PointingHandCursor
                             onClicked: backend.toggleMount()
+                        }
+                    }
+
+                    // Sync Status Panel Widget pill (shows when files are syncing vs in sync)
+                    Rectangle {
+                        id: syncWidgetPill
+                        color: backend.syncing ? theme.cardSelectedBg : theme.cardBg
+                        border.color: backend.syncing ? theme.cyan : theme.green
+                        border.width: 1
+                        radius: Math.min(4, theme.radius)
+                        implicitHeight: 34
+                        implicitWidth: syncPillCol.implicitWidth + 22
+
+                        ColumnLayout {
+                            id: syncPillCol
+                            anchors.centerIn: parent
+                            spacing: 2
+
+                            RowLayout {
+                                spacing: 6
+
+                                Rectangle {
+                                    width: 8
+                                    height: 8
+                                    radius: 4
+                                    color: backend.syncing ? theme.cyan : theme.green
+                                }
+
+                                Label {
+                                    text: backend.syncStateLabel
+                                    font.pixelSize: 12
+                                    font.bold: true
+                                    color: backend.syncing ? theme.cyan : theme.green
+                                }
+
+                                Rectangle {
+                                    radius: Math.min(3, theme.radius)
+                                    color: backend.syncing ? theme.cyan : theme.green
+                                    implicitWidth: syncPillBadge.implicitWidth + 8
+                                    implicitHeight: 15
+
+                                    Label {
+                                        id: syncPillBadge
+                                        anchors.centerIn: parent
+                                        text: backend.syncing
+                                              ? Math.round(backend.syncProgress * 100) + "%"
+                                              : qsTr("IN SYNC")
+                                        font.pixelSize: 9
+                                        font.bold: true
+                                        color: "black"
+                                    }
+                                }
+                            }
+
+                            Rectangle {
+                                visible: backend.syncing
+                                Layout.fillWidth: true
+                                implicitHeight: 3
+                                radius: 1.5
+                                color: theme.windowBg
+
+                                Rectangle {
+                                    width: Math.max(6, parent.width * backend.syncProgress)
+                                    height: parent.height
+                                    radius: 1.5
+                                    color: theme.cyan
+                                }
+                            }
+                        }
+
+                        MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: syncStatusPanel.open()
                         }
                     }
 
@@ -950,12 +1030,114 @@ ApplicationWindow {
                     Layout.maximumWidth: 305
                     Layout.fillWidth: false
                     Layout.fillHeight: true
-                    spacing: 12
+                    spacing: 10
+
+                    // Live Sync Status Panel Widget Card
+                    Rectangle {
+                        Layout.fillWidth: true
+                        implicitHeight: 96
+                        color: theme.panelBg
+                        border.color: backend.syncing ? theme.cyan : theme.green
+                        border.width: 1
+                        radius: theme.radius
+
+                        ColumnLayout {
+                            anchors.fill: parent
+                            anchors.margins: 12
+                            spacing: 5
+
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: 6
+
+                                Rectangle {
+                                    width: 8
+                                    height: 8
+                                    radius: 4
+                                    color: backend.syncing ? theme.cyan : theme.green
+                                }
+
+                                Label {
+                                    text: qsTr("SYNC PANEL WIDGET")
+                                    font.pixelSize: 10
+                                    font.bold: true
+                                    color: theme.textMuted
+                                    Layout.fillWidth: true
+                                }
+
+                                Rectangle {
+                                    color: backend.syncing ? theme.cyan : theme.green
+                                    radius: Math.min(3, theme.radius)
+                                    implicitHeight: 16
+                                    implicitWidth: rightSyncStateBadge.implicitWidth + 8
+
+                                    Label {
+                                        id: rightSyncStateBadge
+                                        anchors.centerIn: parent
+                                        text: backend.syncing ? qsTr("SYNCING") : qsTr("IN SYNC")
+                                        font.pixelSize: 9
+                                        font.bold: true
+                                        color: "black"
+                                    }
+                                }
+                            }
+
+                            Label {
+                                text: backend.syncDetailText
+                                font.pixelSize: 11
+                                font.bold: true
+                                color: theme.textPrimary
+                                Layout.fillWidth: true
+                                elide: Text.ElideRight
+                            }
+
+                            Rectangle {
+                                Layout.fillWidth: true
+                                height: 5
+                                radius: 2.5
+                                color: theme.inputBg
+                                clip: true
+
+                                Rectangle {
+                                    width: Math.round(parent.width * (backend.syncing ? backend.syncProgress : 1.0))
+                                    height: parent.height
+                                    radius: 2.5
+                                    color: backend.syncing ? theme.cyan : theme.green
+                                }
+                            }
+
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: 6
+
+                                Label {
+                                    text: backend.autoStartSummary
+                                    font.pixelSize: 10
+                                    color: theme.green
+                                    Layout.fillWidth: true
+                                    elide: Text.ElideRight
+                                }
+
+                                Label {
+                                    text: "S"
+                                    font.pixelSize: 10
+                                    font.family: "monospace"
+                                    color: theme.textMuted
+                                }
+                            }
+                        }
+
+                        MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: syncStatusPanel.open()
+                        }
+                    }
 
                     // Selected File Inspector Card
                     Rectangle {
                         Layout.fillWidth: true
-                        implicitHeight: 280
+                        implicitHeight: 252
                         color: theme.panelBg
                         border.color: theme.border
                         border.width: 1
@@ -1221,5 +1403,9 @@ ApplicationWindow {
 
     ConnectDialog {
         id: connectDialog
+    }
+
+    SyncStatusPanel {
+        id: syncStatusPanel
     }
 }

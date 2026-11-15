@@ -1,0 +1,25 @@
+{
+  "bar.syncing": "Syncing…",
+  "bar.synced": "In Sync",
+  "panel.title": "GDrive Smart Cache",
+  "panel.status.syncing": "Syncing files…",
+  "panel.status.synced": "All files in sync",
+  "panel.detail.syncing": "Syncing %1 (%2%)",
+  "panel.detail.synced": "%1 of %2 files cached locally · ~/Drive",
+  "panel.cache.header": "LOCAL CACHE BUDGET",
+  "panel.cache.saved": "%1% saved (%2 in cloud)",
+  "panel.cache.pinned": "Pinned: %1",
+  "panel.cache.hot": "Frequent / Hot: %1",
+  "panel.files.header": "FILE SYNC & RESIDENCY",
+  "panel.badge.syncing": "SYNCING",
+  "panel.badge.pinned": "IN SYNC · PINNED",
+  "panel.badge.cached": "IN SYNC · CACHED",
+  "panel.badge.cloud": "IN SYNC · CLOUD 0 B",
+  "panel.action.sync": "Sync Now",
+  "panel.action.evict": "Evict Cold",
+  "panel.action.open": "Open App",
+  "panel.files.count": {
+    "one": "%1 file in Drive",
+    "other": "%1 files in Drive"
+  }
+}

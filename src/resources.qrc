@@ -4,8 +4,14 @@
         <file alias="ShortcutOverlay.qml">ShortcutOverlay.qml</file>
         <file alias="BudgetDialog.qml">BudgetDialog.qml</file>
         <file alias="ConnectDialog.qml">ConnectDialog.qml</file>
+        <file alias="SyncStatusPanel.qml">SyncStatusPanel.qml</file>
         <file alias="gdrive.svg">../pkgbuild/gdrive.svg</file>
         <file alias="skill/SKILL.md">skill/SKILL.md</file>
+        <file alias="plugin/manifest.json">../plugin/manifest.json</file>
+        <file alias="plugin/Model.js">../plugin/Model.js</file>
+        <file alias="plugin/Panel.qml">../plugin/Panel.qml</file>
+        <file alias="plugin/i18n/en.json">../plugin/i18n/en.json</file>
+        <file alias="plugin/i18n/da.json">../plugin/i18n/da.json</file>
         <file alias="i18n/en.json">i18n/en.json</file>
         <file alias="i18n/da.json">i18n/da.json</file>
         <file alias="i18n/de.json">i18n/de.json</file>

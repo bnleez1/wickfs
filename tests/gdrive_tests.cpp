@@ -1,6 +1,10 @@
 #include <QDateTime>
 #include <QDir>
 #include <QFile>
+#include <QJSEngine>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QTemporaryDir>
 #include <QtTest>
 #include <sys/stat.h>
@@ -226,6 +230,117 @@ private slots:
         QCOMPARE(translator.translate("Main", "%n files", nullptr, 25), QString("%n файлов"));
         QCOMPARE(Translator::pluralCategory("ar", 11), QString("many"));
         QCOMPARE(Translator::pluralCategory("ja", 1), QString("other"));
+    }
+
+    void syncStateTransitionsBetweenSyncingAndInSync()
+    {
+        QTemporaryDir dir;
+        Backend backend(dir.path(), dir.path() + "/mnt");
+
+        QVERIFY(!backend.syncing());
+        QCOMPARE(backend.syncState(), QString("synced"));
+        QCOMPARE(backend.syncStateLabel(), QString("All files in sync"));
+        QCOMPARE(backend.syncedFileCount(), backend.totalFileCount());
+
+        backend.beginSyncSimulation("Q4-Roadmap-Deck.pptx", 2);
+        QVERIFY(backend.syncing());
+        QCOMPARE(backend.syncState(), QString("syncing"));
+        QCOMPARE(backend.syncStateLabel(), QString("Syncing files…"));
+        QCOMPARE(backend.activeSyncFile(), QString("Q4-Roadmap-Deck.pptx"));
+        QCOMPARE(backend.pendingSyncCount(), 2);
+
+        // Verify state.json reflects active sync state for the Omarchy bar widget
+        QFile stateFile(dir.path() + "/state.json");
+        QVERIFY(stateFile.open(QIODevice::ReadOnly));
+        const QJsonObject root = QJsonDocument::fromJson(stateFile.readAll()).object();
+        QCOMPARE(root.value("syncing").toBool(), true);
+        QCOMPARE(root.value("syncState").toString(), QString("syncing"));
+        QCOMPARE(root.value("activeSyncFile").toString(), QString("Q4-Roadmap-Deck.pptx"));
+        stateFile.close();
+
+        backend.finishSyncSimulation();
+        QVERIFY(!backend.syncing());
+        QCOMPARE(backend.syncState(), QString("synced"));
+        QCOMPARE(backend.syncStateLabel(), QString("All files in sync"));
+        QCOMPARE(backend.pendingSyncCount(), 0);
+    }
+
+    void pluginModelParsesStateAndSanitizesMarkup()
+    {
+        QFile jsFile(":/plugin/Model.js");
+        QVERIFY(jsFile.open(QIODevice::ReadOnly));
+        QString code = QString::fromUtf8(jsFile.readAll());
+        code.replace(".pragma library", "");
+
+        QJSEngine engine;
+        QJSValue evalRes = engine.evaluate(code);
+        QVERIFY2(!evalRes.isError(), qPrintable(evalRes.toString()));
+
+        // Verify markup-shaped input is sanitized
+        QJsonObject entry;
+        entry.insert("path", "folder/<b>evil.doc</b>");
+        entry.insert("name", "<b>evil.doc</b>");
+        entry.insert("folder", "folder");
+        entry.insert("sizeBytes", 1048576);
+        entry.insert("state", "cached");
+        entry.insert("pinned", false);
+        entry.insert("accessCount", 5);
+        entry.insert("isFrequent", true);
+        entry.insert("hotScore", 88.5);
+
+        QJsonArray entriesArr;
+        entriesArr.append(entry);
+
+        QJsonObject payload;
+        payload.insert("syncing", true);
+        payload.insert("syncState", "syncing");
+        payload.insert("activeSyncFile", "<script>alert(1)</script> & \"bad.txt\"");
+        payload.insert("syncProgress", 0.65);
+        payload.insert("pendingSyncCount", 2);
+        payload.insert("maxCacheMb", 500);
+        payload.insert("entries", entriesArr);
+
+        const QString maliciousJson = QString::fromUtf8(QJsonDocument(payload).toJson(QJsonDocument::Compact));
+
+        QJSValue parseFn = engine.globalObject().property("parseStateJson");
+        QVERIFY(parseFn.isCallable());
+        QJSValue parsed = parseFn.call({maliciousJson});
+        QCOMPARE(parsed.property("ok").toBool(), true);
+        QCOMPARE(parsed.property("syncing").toBool(), true);
+        QCOMPARE(parsed.property("syncState").toString(), QString("syncing"));
+        QCOMPARE(parsed.property("syncPercent").toInt(), 65);
+
+        const QString safeActive = parsed.property("activeSyncFile").toString();
+        QVERIFY(!safeActive.contains('<'));
+        QVERIFY(!safeActive.contains('>'));
+        QVERIFY(!safeActive.contains('&'));
+
+        QJSValue tooltipFn = engine.globalObject().property("buildTooltip");
+        const QString tooltip = tooltipFn.call({parsed}).toString();
+        QVERIFY(!tooltip.contains('<'));
+        QVERIFY(!tooltip.contains('>'));
+    }
+
+    void testStandbyWakeAndAutoStart()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        Backend b(dir.path() + "/state", dir.path() + "/mnt");
+
+        QCOMPARE(b.wakeSyncCount(), 0);
+        QCOMPARE(b.autoStartEnabled(), true);
+        QVERIFY(!b.autoStartSummary().isEmpty());
+
+        // Entering standby (sleeping=true) should flush state without incrementing wakeSyncCount
+        b.handleSystemWake(true);
+        QCOMPARE(b.wakeSyncCount(), 0);
+        QVERIFY(QFileInfo::exists(dir.path() + "/state/state.json"));
+
+        // Waking from standby (sleeping=false) should mount ~/Drive and trigger syncNow()
+        b.handleSystemWake(false);
+        QCOMPARE(b.wakeSyncCount(), 1);
+        QVERIFY(b.mounted());
+        QCOMPARE(b.syncState(), QString("synced"));
     }
 
 private:

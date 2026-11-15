@@ -21,3 +21,5 @@ SOURCES += \
     ../src/portalfilepicker.cpp \
     ../src/theme.cpp \
     ../src/translator.cpp
+
+RESOURCES += ../src/resources.qrc

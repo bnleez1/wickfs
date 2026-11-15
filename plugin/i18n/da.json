@@ -1,0 +1,25 @@
+{
+  "bar.syncing": "Synkroniserer…",
+  "bar.synced": "Synkroniseret",
+  "panel.title": "GDrive Smart-cache",
+  "panel.status.syncing": "Synkroniserer filer…",
+  "panel.status.synced": "Alle filer er synkroniseret",
+  "panel.detail.syncing": "Synkroniserer %1 (%2%)",
+  "panel.detail.synced": "%1 af %2 filer lagret lokalt · ~/Drive",
+  "panel.cache.header": "LOKALT CACHE-BUDGET",
+  "panel.cache.saved": "%1% sparet (%2 i skyen)",
+  "panel.cache.pinned": "Fastgjort: %1",
+  "panel.cache.hot": "Hyppig / Varm: %1",
+  "panel.files.header": "FIL-SYNK OG LAGRING",
+  "panel.badge.syncing": "SYNKRONISERER",
+  "panel.badge.pinned": "SYNK · FASTGJORT",
+  "panel.badge.cached": "SYNK · CACHET",
+  "panel.badge.cloud": "SYNK · SKY 0 B",
+  "panel.action.sync": "Synk nu",
+  "panel.action.evict": "Ryd kolde",
+  "panel.action.open": "Åbn app",
+  "panel.files.count": {
+    "one": "%1 fil på Drev",
+    "other": "%1 filer på Drev"
+  }
+}

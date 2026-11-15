@@ -29,6 +29,7 @@ Popup {
         { keys: "P", desc: qsTr("Toggle Keep Offline (Pin / Unpin selected file)") },
         { keys: "E / Shift+E", desc: qsTr("Evict selected file / Evict all cold cached files") },
         { keys: "M", desc: qsTr("Mount or unmount ~/Drive FUSE3 virtual filesystem") },
+        { keys: "S", desc: qsTr("Open Sync Status Panel Widget (syncing vs in-sync monitor)") },
         { keys: "R / F5", desc: qsTr("Sync catalog with Google Drive and enforce disk budget") },
         { keys: "B", desc: qsTr("Open disk space budget & LFU/LRU policy settings") },
         { keys: "C", desc: qsTr("Connect Google Drive (rclone OAuth or mirror folder)") },

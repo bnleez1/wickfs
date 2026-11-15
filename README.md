@@ -15,6 +15,9 @@ Smart on-demand Google Drive virtual filesystem (`~/Drive`) and LFU/LRU disk cac
    Files that reach the frequent-access threshold are automatically kept warm on disk.
 4. **Automatic Disk Space Budget & Free-Space Floor**: Whenever cached files exceed your **Max Cache Budget** or available disk space drops toward your **Minimum Free Disk Floor**, `gdrive` automatically evicts the coldest non-pinned files back to `Cloud Only (0 B)` stubs.
 5. **Pinned Offline Files**: Pinning any file (`P`) locks it on local disk so it is never evicted.
+6. **Sync Status Panel Widget (In-App + Omarchy Top Bar `ben.gdrive`)**:
+   - **Omarchy Top-Bar Plugin (`ben.gdrive`)**: Lives in `~/.config/omarchy/plugins/ben.gdrive/` and displays a live capsule in the Omarchy shell bar indicating when files are **Syncing…** (with file name & transfer percentage) vs **In Sync** (with cached byte count). Clicking the top-bar widget opens a `KeyboardPanel` popup with per-file synchronization status, cache budget bar, and quick actions (`Sync Now`, `Open ~/Drive`, `Launch GDrive`).
+   - **In-App Sync Status Panel (`S`)**: Interactive header widget and detailed popup showing real-time transfer progress, file-by-file sync states (`HYDRATING`, `PINNED`, `FREQUENT`, `CACHED`, `CLOUD SYNCED`), and a `Simulate Sync` preview toggle.
 
 ## Keyboard Shortcuts
 
@@ -25,6 +28,7 @@ Smart on-demand Google Drive virtual filesystem (`~/Drive`) and LFU/LRU disk cac
 | `P` | Toggle **Keep Offline** (Pin / Unpin selected file) |
 | `E` / `Shift+E` | Evict selected file to Cloud Only / Evict all cold cached files |
 | `M` | Mount or unmount the `~/Drive` FUSE3 virtual filesystem |
+| `S` | Open the **Sync Status Panel Widget** (syncing vs in-sync monitor) |
 | `R` / `F5` | Sync catalog with Google Drive (`rclone`) and enforce disk budget |
 | `B` | Open Disk Space Budget & LFU/LRU Eviction Policy settings |
 | `C` | Connect Google Drive (`rclone` OAuth remote or local mirror folder) |
@@ -49,6 +53,7 @@ gdrive pin "Architecture/API-Security-Review.md" --json
 gdrive unpin "Architecture/API-Security-Review.md" --json
 gdrive evict --cold --json
 gdrive budget --max-mb 250 --min-free-gb 15 --threshold 3 --json
+gdrive plugin install --json
 gdrive skill install --json
 ```
 

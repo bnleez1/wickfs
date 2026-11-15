@@ -35,4 +35,7 @@ gdrive evict --cold --json
 
 # Configure maximum cache size (MB), free disk floor (GB), and frequent access threshold
 gdrive budget --max-mb 250 --min-free-gb 15 --threshold 3 --json
+
+# Install or update the Omarchy top-bar sync status widget plugin (ben.gdrive)
+gdrive plugin install --json
 ```

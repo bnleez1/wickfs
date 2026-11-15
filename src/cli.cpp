@@ -3,11 +3,14 @@
 
 #include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QGuiApplication>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QProcess>
 #include <QSaveFile>
+#include <QTimer>
 #include <cstdio>
 
 namespace {
@@ -41,8 +44,122 @@ void printUsage() {
         "  gdrive evict [<path>|--cold] [--state-dir DIR] [--json]     Evict a file or all cold cached files\n"
         "  gdrive budget [--max-mb N] [--min-free-gb N] [--threshold N] [--json]\n"
         "  gdrive sync [--remote NAME] [--folder DIR] [--json]         Sync catalog & enforce cache budget\n"
+        "  gdrive daemon [--once] [--json]                             Run background sync & standby-wake daemon\n"
+        "  gdrive autostart [enable|status] [--json]                   Configure auto-start on boot & wake from standby\n"
+        "  gdrive plugin install [--json]                              Install the Omarchy top-bar sync widget (ben.gdrive)\n"
         "  gdrive skill install [--json]                               Install the gdrive agent skill\n"
         "  gdrive --help                                               Show this help\n");
+}
+
+int cmdAutostart(const QString &subcmd, bool json) {
+    const QString home = QDir::homePath();
+    const QString systemdUserDir = home + "/.config/systemd/user";
+    const QString servicePath = systemdUserDir + "/gdrive.service";
+    const QString defaultWantsDir = systemdUserDir + "/default.target.wants";
+    const QString graphicalWantsDir = systemdUserDir + "/graphical-session.target.wants";
+    const QString postBootHookDir = home + "/.config/omarchy/hooks/post-boot.d";
+    const QString postBootHookPath = postBootHookDir + "/gdrive-sync";
+
+    if (subcmd == "enable" || subcmd.isEmpty()) {
+        QDir().mkpath(defaultWantsDir);
+        QDir().mkpath(graphicalWantsDir);
+        QDir().mkpath(postBootHookDir);
+
+        const QByteArray serviceContent =
+            "[Unit]\n"
+            "Description=GDrive Smart Cache FUSE3 Daemon & Standby Wake Sync\n"
+            "After=network-online.target dbus.socket graphical-session.target\n"
+            "Wants=network-online.target\n\n"
+            "[Service]\n"
+            "Type=simple\n"
+            "ExecStart=%h/.local/bin/gdrive daemon\n"
+            "Restart=always\n"
+            "RestartSec=3\n\n"
+            "[Install]\n"
+            "WantedBy=default.target graphical-session.target\n";
+
+        QSaveFile svcOut(servicePath);
+        if (svcOut.open(QIODevice::WriteOnly)) {
+            svcOut.write(serviceContent);
+            svcOut.commit();
+        }
+
+        QFile::remove(defaultWantsDir + "/gdrive.service");
+        QFile::link(servicePath, defaultWantsDir + "/gdrive.service");
+        QFile::remove(graphicalWantsDir + "/gdrive.service");
+        QFile::link(servicePath, graphicalWantsDir + "/gdrive.service");
+
+        const QByteArray hookContent =
+            "#!/bin/bash\n"
+            "# Ensure GDrive Smart Cache daemon is active and synced after boot\n"
+            "systemctl --user start gdrive.service 2>/dev/null || \"$HOME/.local/bin/gdrive\" sync >/dev/null 2>&1 &\n";
+
+        QSaveFile hookOut(postBootHookPath);
+        if (hookOut.open(QIODevice::WriteOnly)) {
+            hookOut.write(hookContent);
+            hookOut.commit();
+            QFile::setPermissions(postBootHookPath,
+                QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner |
+                QFileDevice::ReadGroup | QFileDevice::ExeGroup |
+                QFileDevice::ReadOther | QFileDevice::ExeOther);
+        }
+    }
+
+    const bool serviceExists = QFileInfo::exists(servicePath);
+    const bool hookExists = QFileInfo::exists(postBootHookPath);
+
+    if (json) {
+        printOut({
+            {"ok", serviceExists},
+            {"autoStartOnBoot", serviceExists},
+            {"wakeFromStandbySync", true},
+            {"systemdService", servicePath},
+            {"postBootHook", postBootHookPath},
+            {"hookInstalled", hookExists}
+        });
+    } else {
+        std::fprintf(stdout, "Auto-start on reboot:       %s (%s)\n",
+                     serviceExists ? "enabled" : "disabled",
+                     servicePath.toUtf8().constData());
+        std::fprintf(stdout, "Wake from standby sync:     enabled (org.freedesktop.login1.Manager.PrepareForSleep)\n");
+        std::fprintf(stdout, "Omarchy post-boot hook:     %s (%s)\n",
+                     hookExists ? "installed" : "missing",
+                     postBootHookPath.toUtf8().constData());
+    }
+    return serviceExists ? 0 : 1;
+}
+
+int cmdPluginInstall(bool json) {
+    const QString destDir = QDir::homePath() + "/.config/omarchy/plugins/ben.gdrive";
+    QDir().mkpath(destDir + "/i18n");
+    const QStringList relFiles = {
+        "manifest.json",
+        "Model.js",
+        "Panel.qml",
+        "i18n/en.json",
+        "i18n/da.json"
+    };
+    for (const QString &rel : relFiles) {
+        QFile src(":/plugin/" + rel);
+        if (!src.open(QIODevice::ReadOnly)) {
+            printErr("Bundled plugin resource missing: " + rel, json);
+            return 1;
+        }
+        const QByteArray data = src.readAll();
+        const QString destPath = destDir + "/" + rel;
+        QSaveFile out(destPath);
+        if (!out.open(QIODevice::WriteOnly) || out.write(data) != data.size() || !out.commit()) {
+            printErr("Failed to write plugin file to " + destPath, json);
+            return 1;
+        }
+    }
+    if (json) {
+        printOut({{"ok", true}, {"pluginId", "ben.gdrive"}, {"path", destDir}});
+    } else {
+        std::fprintf(stdout, "Installed Omarchy bar widget plugin (ben.gdrive) to %s\n",
+                     destDir.toUtf8().constData());
+    }
+    return 0;
 }
 
 int cmdSkillInstall(bool json) {
@@ -98,7 +215,8 @@ bool isCliInvocation(const QStringList &args) {
     const QString cmd = args.at(1);
     return cmd == "check" || cmd == "status" || cmd == "ls" || cmd == "access"
         || cmd == "pin" || cmd == "unpin" || cmd == "evict" || cmd == "budget"
-        || cmd == "sync" || cmd == "skill"
+        || cmd == "sync" || cmd == "daemon" || cmd == "autostart"
+        || cmd == "plugin" || cmd == "skill"
         || cmd == "--help" || cmd == "-h" || cmd == "--version" || cmd == "-v";
 }
 
@@ -126,6 +244,16 @@ int runCli(int argc, char *argv[]) {
             return cmdSkillInstall(json);
         printErr("Usage: gdrive skill install [--json]", json);
         return 1;
+    }
+    if (cmd == "plugin") {
+        if (args.value(2) == "install")
+            return cmdPluginInstall(json);
+        printErr("Usage: gdrive plugin install [--json]", json);
+        return 1;
+    }
+    if (cmd == "autostart") {
+        const QString sub = extractPositional(args);
+        return cmdAutostart(sub, json);
     }
 
     const QString stateDir = extractOption(args, "--state-dir");
@@ -173,9 +301,19 @@ int runCli(int argc, char *argv[]) {
         o.insert("pinnedFiles", backend.pinnedFileCount());
         o.insert("cachedFiles", backend.cachedFileCount());
         o.insert("cloudOnlyFiles", backend.cloudOnlyFileCount());
+        o.insert("syncing", backend.syncing());
+        o.insert("syncState", backend.syncState());
+        o.insert("syncStateLabel", backend.syncStateLabel());
+        o.insert("syncDetailText", backend.syncDetailText());
+        o.insert("activeSyncFile", backend.activeSyncFile());
+        o.insert("syncProgress", backend.syncProgress());
+        o.insert("lastSyncedFormatted", backend.lastSyncedFormatted());
         if (json) {
             printOut(o);
         } else {
+            std::fprintf(stdout, "Sync status:  %s (%s)\n",
+                         backend.syncStateLabel().toUtf8().constData(),
+                         backend.syncDetailText().toUtf8().constData());
             std::fprintf(stdout, "Connection:   %s\n", backend.connectionSummary().toUtf8().constData());
             std::fprintf(stdout, "Mount point:  %s\n", backend.mountPoint().toUtf8().constData());
             std::fprintf(stdout, "Local cache:  %s / %s budget (%s pinned, %s hot)\n",
@@ -386,6 +524,67 @@ int runCli(int argc, char *argv[]) {
                          backend.totalFileCount(), backend.cachedFormatted().toUtf8().constData());
         }
         return 0;
+    }
+
+    if (cmd == "daemon") {
+        if (!backend.mounted())
+            backend.mountDrive();
+        backend.syncNow();
+
+        if (args.contains("--once")) {
+            if (json) {
+                printOut({
+                    {"ok", true},
+                    {"mode", "daemon-once"},
+                    {"mounted", backend.mounted()},
+                    {"mountPoint", backend.mountPoint()},
+                    {"syncState", backend.syncState()},
+                    {"totalFiles", backend.totalFileCount()},
+                    {"cachedBytes", static_cast<double>(backend.cachedBytes())},
+                    {"autoStartEnabled", backend.autoStartEnabled()}
+                });
+            } else {
+                std::fprintf(stdout, "gdrive daemon initialized: mounted=%s, files=%d, state=%s\n",
+                             backend.mounted() ? "yes" : "no",
+                             backend.totalFileCount(),
+                             backend.syncState().toUtf8().constData());
+            }
+            return 0;
+        }
+
+        // Periodic background sync every 5 minutes
+        QTimer syncTimer;
+        syncTimer.setInterval(5 * 60 * 1000);
+        QObject::connect(&syncTimer, &QTimer::timeout, &backend, [&backend]() {
+            if (!backend.mounted())
+                backend.mountDrive();
+            backend.syncNow();
+        });
+        syncTimer.start();
+
+        // Fallback dbus-monitor watcher for PrepareForSleep in addition to QDBusConnection
+        QProcess sleepMonitor;
+        QObject::connect(&sleepMonitor, &QProcess::readyReadStandardOutput, &backend, [&sleepMonitor, &backend]() {
+            while (sleepMonitor.canReadLine()) {
+                const QString line = QString::fromUtf8(sleepMonitor.readLine());
+                if (line.contains(QLatin1String("boolean true"))) {
+                    backend.handleSystemWake(true);
+                } else if (line.contains(QLatin1String("boolean false"))) {
+                    QTimer::singleShot(1500, &backend, [&backend]() {
+                        backend.handleSystemWake(false);
+                    });
+                }
+            }
+        });
+        sleepMonitor.start(QStringLiteral("dbus-monitor"), {
+            QStringLiteral("--system"),
+            QStringLiteral("type='signal',sender='org.freedesktop.login1',interface='org.freedesktop.login1.Manager',member='PrepareForSleep'")
+        });
+
+        std::fprintf(stdout, "gdrive daemon running (mount=%s, standby-wake listener=active)\n",
+                     backend.mountPoint().toUtf8().constData());
+        std::fflush(stdout);
+        return app.exec();
     }
 
     printErr("Unknown command: " + cmd, json);

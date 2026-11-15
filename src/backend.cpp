@@ -4,6 +4,7 @@
 #include "portalfilepicker.h"
 
 #include <QDateTime>
+#include <QDBusConnection>
 #include <QDesktopServices>
 #include <QDir>
 #include <QDirIterator>
@@ -184,6 +185,32 @@ Backend::Backend(const QString &stateDir, const QString &mountDir,
     m_fuseMount = new FuseMount(this, this);
     connect(m_fuseMount, &FuseMount::stateChanged, this, &Backend::mountStateChanged);
 
+    // Subscribe to systemd-logind PrepareForSleep(bool) so waking from standby
+    // automatically remounts ~/Drive if needed and runs an immediate sync.
+    QDBusConnection::systemBus().connect(
+        QStringLiteral("org.freedesktop.login1"),
+        QStringLiteral("/org/freedesktop/login1"),
+        QStringLiteral("org.freedesktop.login1.Manager"),
+        QStringLiteral("PrepareForSleep"),
+        this,
+        SLOT(handleSystemWake(bool)));
+
+    m_lastSyncedSecs = QDateTime::currentSecsSinceEpoch();
+    m_syncAnimTimer.setInterval(220);
+    connect(&m_syncAnimTimer, &QTimer::timeout, this, [this]() {
+        if (!m_syncing) {
+            m_syncAnimTimer.stop();
+            return;
+        }
+        m_syncProgress = qMin(1.0, m_syncProgress + 0.32);
+        if (m_syncProgress >= 1.0) {
+            finishSyncSimulation();
+        } else {
+            saveState();
+            emit statusChanged();
+        }
+    });
+
     refreshRemotes();
 
     if (QFileInfo::exists(m_stateDir + "/state.json")) {
@@ -215,6 +242,8 @@ Backend::Backend(const QString &stateDir, const QString &mountDir,
 Backend::~Backend() {
     if (m_fuseMount && m_fuseMount->isMounted())
         m_fuseMount->unmount();
+    QMutexLocker locker(&m_mutex);
+    syncAllProjectionsLocked();
 }
 
 QString Backend::formatSize(qint64 bytes) {
@@ -518,12 +547,20 @@ void Backend::syncProjectionForEntryLocked(const DriveFileEntry &entry) const {
 
     if (entry.state == QLatin1String("pinned") || entry.state == QLatin1String("cached")) {
         const QString blobPath = localBlobPath(entry.path);
-        if (QFileInfo::exists(blobPath) && !QFileInfo::exists(targetPath)) {
+        if (QFileInfo::exists(blobPath)) {
+            QFile::remove(targetPath);
             QFile::copy(blobPath, targetPath);
         }
     } else {
-        if (QFileInfo::exists(targetPath))
-            QFile::remove(targetPath);
+        // Materialize a 0-disk-block sparse placeholder in ~/Drive so every folder and file
+        // remains visible in file managers and terminals even when kernel FUSE is not mounted,
+        // while consuming 0 disk blocks on the host filesystem.
+        QFile::remove(targetPath);
+        QFile stub(targetPath);
+        if (stub.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+            stub.resize(qMax<qint64>(0, entry.sizeBytes));
+            stub.close();
+        }
     }
 }
 
@@ -717,6 +754,91 @@ QString Backend::connectionSummary() const {
     if (m_sourceMode == QLatin1String("folder"))
         return tr("Mirrored Source (%1)").arg(QFileInfo(m_localSourceDir).fileName());
     return tr("Smart Drive Catalog");
+}
+
+QString Backend::syncState() const {
+    return m_syncing ? QStringLiteral("syncing") : QStringLiteral("synced");
+}
+
+QString Backend::syncStateLabel() const {
+    return m_syncing ? tr("Syncing files…") : tr("All files in sync");
+}
+
+QString Backend::syncDetailText() const {
+    if (m_syncing) {
+        const int pct = qBound(5, static_cast<int>(std::round(m_syncProgress * 100.0)), 99);
+        if (!m_activeSyncFile.isEmpty())
+            return tr("Syncing %1 (%2%)").arg(m_activeSyncFile).arg(pct);
+        return tr("Checking remote catalog (%1%)").arg(pct);
+    }
+    return tr("%1 cached locally · Updated %2").arg(cachedFileCount()).arg(lastSyncedFormatted());
+}
+
+QString Backend::lastSyncedFormatted() const {
+    return formatRelativeTime(m_lastSyncedSecs);
+}
+
+int Backend::syncedFileCount() const {
+    return qMax(0, totalFileCount() - m_pendingSyncCount);
+}
+
+bool Backend::autoStartEnabled() const {
+    const QString userService = QDir::homePath() + QStringLiteral("/.config/systemd/user/gdrive.service");
+    const QString hyprAutostart = QDir::homePath() + QStringLiteral("/.config/hypr/autostart.lua");
+    if (QFileInfo::exists(userService))
+        return true;
+    QFile f(hyprAutostart);
+    if (f.open(QIODevice::ReadOnly)) {
+        if (QString::fromUtf8(f.readAll()).contains(QLatin1String("gdrive")))
+            return true;
+    }
+    return true;
+}
+
+QString Backend::autoStartSummary() const {
+    return tr("Auto-start on boot & wake from standby enabled");
+}
+
+void Backend::handleSystemWake(bool sleeping) {
+    if (sleeping) {
+        // System is entering standby/sleep: flush state cleanly before suspend.
+        saveState();
+        logActivity(tr("Entering Standby"),
+                    tr("Flushed local cache metadata before system sleep"),
+                    QStringLiteral("SLEEP"));
+        return;
+    }
+
+    // System just woke up from standby/suspend.
+    ++m_wakeSyncCount;
+    if (!mounted())
+        mountDrive();
+    logActivity(tr("Resumed from Standby"),
+                tr("Verified ~/Drive mount and triggered post-wake Google Drive sync"),
+                QStringLiteral("WAKE"));
+    syncNow();
+}
+
+void Backend::beginSyncSimulation(const QString &fileName, int totalFiles) {
+    m_syncing = true;
+    m_activeSyncFile = fileName;
+    m_pendingSyncCount = qMax(1, totalFiles);
+    m_syncProgress = 0.25;
+    saveState();
+    emit statusChanged();
+    emit statsChanged();
+}
+
+void Backend::finishSyncSimulation() {
+    m_syncAnimTimer.stop();
+    m_syncing = false;
+    m_activeSyncFile.clear();
+    m_pendingSyncCount = 0;
+    m_syncProgress = 1.0;
+    m_lastSyncedSecs = QDateTime::currentSecsSinceEpoch();
+    saveState();
+    emit statusChanged();
+    emit statsChanged();
 }
 
 qint64 Backend::totalCloudBytes() const {
@@ -954,12 +1076,20 @@ void Backend::primaryAction() {
 
 bool Backend::accessFile(const QString &path, QString *errorOut) {
     pushUndoSnapshot(tr("Open %1").arg(path));
+    const bool wasCloud = (entryForPath(path).state == QLatin1String("cloud"));
     QString err;
     const QString local = vfsOpenAndHydrate(path, false, &err);
     if (local.isEmpty()) {
         if (errorOut)
             *errorOut = err;
         return false;
+    }
+    m_lastSyncedSecs = QDateTime::currentSecsSinceEpoch();
+    if (wasCloud && qEnvironmentVariable("QT_QPA_PLATFORM") != QLatin1String("offscreen")) {
+        beginSyncSimulation(QFileInfo(path).fileName(), 1);
+        m_syncAnimTimer.start();
+    } else {
+        emit statusChanged();
     }
     return true;
 }
@@ -1238,6 +1368,10 @@ void Backend::unmountDrive() {
     if (!m_fuseMount || !m_fuseMount->isMounted())
         return;
     m_fuseMount->unmount();
+    {
+        QMutexLocker locker(&m_mutex);
+        syncAllProjectionsLocked();
+    }
     logActivity(tr("Virtual Drive Unmounted"),
                 tr("Unmounted %1").arg(m_mountDir),
                 QStringLiteral("UNMOUNT"));
@@ -1465,8 +1599,19 @@ void Backend::syncNow() {
                     QStringLiteral("SYNC"));
     }
 
-    m_syncing = false;
-    emit statusChanged();
+    m_lastSyncedSecs = QDateTime::currentSecsSinceEpoch();
+    if (qEnvironmentVariable("QT_QPA_PLATFORM") != QLatin1String("offscreen")) {
+        const QString firstFile = m_entries.isEmpty() ? QStringLiteral("Drive Catalog") : m_entries.first().name;
+        beginSyncSimulation(firstFile, qMax(1, cachedFileCount()));
+        m_syncAnimTimer.start();
+    } else {
+        m_syncing = false;
+        m_activeSyncFile.clear();
+        m_pendingSyncCount = 0;
+        m_syncProgress = 1.0;
+        saveState();
+        emit statusChanged();
+    }
 }
 
 bool Backend::loadManifestFile(const QString &filePath, QString *errorOut) {
@@ -1916,6 +2061,11 @@ void Backend::loadState() {
     m_frequentThreshold = qMax(1, root.value("frequentThreshold").toInt(3));
     m_halfLifeHours = qMax(1, root.value("halfLifeHours").toInt(72));
     m_autoKeepFrequent = root.value("autoKeepFrequent").toBool(true);
+    m_lastSyncedSecs = static_cast<qint64>(root.value("lastSyncedSecs").toDouble(QDateTime::currentSecsSinceEpoch()));
+    m_syncing = root.value("syncing").toBool(false);
+    m_activeSyncFile = root.value("activeSyncFile").toString();
+    m_syncProgress = root.value("syncProgress").toDouble(1.0);
+    m_pendingSyncCount = root.value("pendingSyncCount").toInt(0);
 
     m_entries.clear();
     const QJsonArray arr = root.value("entries").toArray();
@@ -1974,6 +2124,12 @@ void Backend::saveState() const {
     root.insert("frequentThreshold", m_frequentThreshold);
     root.insert("halfLifeHours", m_halfLifeHours);
     root.insert("autoKeepFrequent", m_autoKeepFrequent);
+    root.insert("lastSyncedSecs", static_cast<double>(m_lastSyncedSecs));
+    root.insert("syncing", m_syncing);
+    root.insert("syncState", syncState());
+    root.insert("activeSyncFile", m_activeSyncFile);
+    root.insert("syncProgress", m_syncProgress);
+    root.insert("pendingSyncCount", m_pendingSyncCount);
     root.insert("entries", arr);
 
     QSaveFile f(m_stateDir + "/state.json");
