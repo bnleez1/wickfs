@@ -1,0 +1,20 @@
+{
+  "%n files": {
+    "other": "%n 個のファイル"
+  },
+  "GDrive Smart Cache": "GDrive スマートキャッシュ",
+  "Open ~/Drive": "~/Drive を開く",
+  "Sync": "同期",
+  "Budget": "容量上限",
+  "Connect": "接続",
+  "Configure": "設定",
+  "Evict Cold Files": "低頻度ファイルを解放",
+  "All Drive Files": "すべてのファイル",
+  "Frequently Accessed": "よく使うファイル",
+  "Pinned Offline": "オフライン固定",
+  "Cached on Disk": "ローカルキャッシュ済",
+  "Cloud Only (0 B)": "クラウドのみ (0 B)",
+  "All Folders": "すべてのフォルダ",
+  "Keyboard Shortcuts": "キーボードショートカット",
+  "Close": "閉じる"
+}

@@ -1,0 +1,23 @@
+{
+  "%n files": {
+    "one": "%n файл",
+    "few": "%n файла",
+    "many": "%n файлов",
+    "other": "%n файла"
+  },
+  "GDrive Smart Cache": "Умный кэш GDrive",
+  "Open ~/Drive": "Открыть ~/Drive",
+  "Sync": "Синхр.",
+  "Budget": "Лимит",
+  "Connect": "Подключить",
+  "Configure": "Настроить",
+  "Evict Cold Files": "Очистить холодные",
+  "All Drive Files": "Все файлы Диска",
+  "Frequently Accessed": "Часто открываемые",
+  "Pinned Offline": "Офлайн-файлы",
+  "Cached on Disk": "В кэше на диске",
+  "Cloud Only (0 B)": "Только в облаке (0 Б)",
+  "All Folders": "Все папки",
+  "Keyboard Shortcuts": "Горячие клавиши",
+  "Close": "Закрыть"
+}

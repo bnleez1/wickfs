@@ -1,0 +1,21 @@
+{
+  "%n files": {
+    "one": "%n Datei",
+    "other": "%n Dateien"
+  },
+  "GDrive Smart Cache": "GDrive Smart-Cache",
+  "Open ~/Drive": "~/Drive öffnen",
+  "Sync": "Sync",
+  "Budget": "Budget",
+  "Connect": "Verbinden",
+  "Configure": "Einrichten",
+  "Evict Cold Files": "Kalte Dateien leeren",
+  "All Drive Files": "Alle Drive-Dateien",
+  "Frequently Accessed": "Häufig geöffnet",
+  "Pinned Offline": "Offline angeheftet",
+  "Cached on Disk": "Auf Festplatte im Cache",
+  "Cloud Only (0 B)": "Nur in der Cloud (0 B)",
+  "All Folders": "Alle Ordner",
+  "Keyboard Shortcuts": "Tastaturkürzel",
+  "Close": "Schließen"
+}

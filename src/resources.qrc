@@ -1,0 +1,18 @@
+<RCC>
+    <qresource prefix="/">
+        <file alias="Main.qml">Main.qml</file>
+        <file alias="ShortcutOverlay.qml">ShortcutOverlay.qml</file>
+        <file alias="BudgetDialog.qml">BudgetDialog.qml</file>
+        <file alias="ConnectDialog.qml">ConnectDialog.qml</file>
+        <file alias="gdrive.svg">../pkgbuild/gdrive.svg</file>
+        <file alias="skill/SKILL.md">skill/SKILL.md</file>
+        <file alias="i18n/en.json">i18n/en.json</file>
+        <file alias="i18n/da.json">i18n/da.json</file>
+        <file alias="i18n/de.json">i18n/de.json</file>
+        <file alias="i18n/es.json">i18n/es.json</file>
+        <file alias="i18n/fr.json">i18n/fr.json</file>
+        <file alias="i18n/pt-BR.json">i18n/pt-BR.json</file>
+        <file alias="i18n/ru.json">i18n/ru.json</file>
+        <file alias="i18n/ja.json">i18n/ja.json</file>
+    </qresource>
+</RCC>
