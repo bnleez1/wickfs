@@ -1,11 +1,11 @@
 [Unit]
-Description=GDrive Smart Cache FUSE3 Daemon & Standby Wake Sync
+Description=WickFS Smart Cache FUSE3 Daemon & Standby Wake Sync
 After=network-online.target dbus.socket graphical-session.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/gdrive daemon
+ExecStart=/usr/bin/wickfs daemon
 Restart=always
 RestartSec=3
 

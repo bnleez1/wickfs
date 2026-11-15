@@ -1,4 +1,4 @@
-// gdrive — Smart on-demand Google Drive virtual filesystem & LFU/LRU cache manager.
+// wickfs — Smart on-demand Google Drive virtual filesystem & LFU/LRU cache manager.
 
 #include <QGuiApplication>
 #include <QIcon>
@@ -26,13 +26,13 @@ int main(int argc, char *argv[]) {
         qunsetenv("QT_QPA_PLATFORMTHEME");
 
     QGuiApplication app(argc, argv);
-    app.setApplicationName("gdrive");
+    app.setApplicationName("wickfs");
     app.setApplicationVersion("0.1.0");
 
-    // Matches the window to gdrive.desktop, so the compositor (Wayland app_id)
+    // Matches the window to wickfs.desktop, so the compositor (Wayland app_id)
     // and the launcher pick up the installed icon.
-    app.setDesktopFileName("gdrive");
-    app.setWindowIcon(QIcon::fromTheme("gdrive", QIcon(":/gdrive.svg")));
+    app.setDesktopFileName("wickfs");
+    app.setWindowIcon(QIcon::fromTheme("wickfs", QIcon(":/wickfs.svg")));
 
     QQuickStyle::setStyle("Material");
 
@@ -44,7 +44,7 @@ int main(int argc, char *argv[]) {
     Theme theme;
     Backend backend;
 
-    // Accept either `gdrive manifest.json` or `gdrive open manifest.json`.
+    // Accept either `wickfs manifest.json` or `wickfs open manifest.json`.
     const QStringList args = app.arguments();
     QString openPath;
     if (args.size() >= 2) {

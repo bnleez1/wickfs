@@ -162,9 +162,9 @@ function parseStateJson(rawText, nowMs) {
 }
 
 function buildTooltip(state) {
-  if (!state || typeof state !== "object") return "GDrive Smart Cache"
+  if (!state || typeof state !== "object") return "WickFS Smart Cache"
   var status = state.syncing ? ("Syncing " + sanitizeText(state.activeSyncFile || "files", 48) + " (" + clampNum(state.syncPercent, 0, 100, 50) + "%)") : "All files in sync"
-  return sanitizeText("GDrive Smart Cache — " + status, 140)
+  return sanitizeText("WickFS Smart Cache — " + status, 140)
 }
 
 function parseState(rawText, nowMs) {

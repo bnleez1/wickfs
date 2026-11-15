@@ -5,8 +5,11 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QScopeGuard>
 #include <QTemporaryDir>
 #include <QtTest>
+#include <cerrno>
+#include <cstdio>
 #include <sys/stat.h>
 
 #include "backend.h"
@@ -14,7 +17,7 @@
 #include "theme.h"
 #include "translator.h"
 
-class GDriveTests : public QObject {
+class WickfsTests : public QObject {
     Q_OBJECT
 
 private slots:
@@ -267,6 +270,12 @@ private slots:
 
     void pluginModelParsesStateAndSanitizesMarkup()
     {
+        QFile manifestFile(":/plugin/manifest.json");
+        QVERIFY(manifestFile.open(QIODevice::ReadOnly));
+        const QJsonObject manifest = QJsonDocument::fromJson(manifestFile.readAll()).object();
+        QCOMPARE(manifest.value("id").toString(), QString("ben.wickfs"));
+        QCOMPARE(manifest.value("name").toString(), QString("WickFS Sync"));
+
         QFile jsFile(":/plugin/Model.js");
         QVERIFY(jsFile.open(QIODevice::ReadOnly));
         QString code = QString::fromUtf8(jsFile.readAll());
@@ -317,6 +326,7 @@ private slots:
 
         QJSValue tooltipFn = engine.globalObject().property("buildTooltip");
         const QString tooltip = tooltipFn.call({parsed}).toString();
+        QVERIFY(tooltip.startsWith("WickFS Smart Cache"));
         QVERIFY(!tooltip.contains('<'));
         QVERIFY(!tooltip.contains('>'));
     }
@@ -382,6 +392,270 @@ private slots:
         QCOMPARE(b.oauthClientId(), QString(""));
     }
 
+    void rcloneSubdirectoriesAppearInVfsAndSurviveRootSync()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+
+        const QString fakeBinDir = dir.path() + "/bin";
+        QVERIFY(QDir().mkpath(fakeBinDir));
+        const QString fakeRclone = fakeBinDir + "/rclone";
+        write(fakeRclone,
+              "#!/bin/sh\n"
+              "if [ \"$1\" = \"listremotes\" ]; then\n"
+              "  echo \"gdrive:\"\n"
+              "  exit 0\n"
+              "fi\n"
+              "if [ \"$1\" = \"lsjson\" ]; then\n"
+              "  for a in \"$@\"; do last=\"$a\"; done\n"
+              "  case \"$last\" in\n"
+              "    \"gdrive:\")\n"
+              "      echo '[{\"Path\":\"A\",\"Name\":\"A\",\"Size\":0,\"IsDir\":true,\"ModTime\":\"2026-11-15T10:00:00Z\"}]'\n"
+              "      ;;\n"
+              "    \"gdrive:A\")\n"
+              "      echo '[{\"Path\":\"Antigravity Agent\",\"Name\":\"Antigravity Agent\",\"Size\":0,\"IsDir\":true,\"ModTime\":\"2026-11-15T10:00:00Z\"},"\
+              "{\"Path\":\"Antigravity Agent/Guide.pdf\",\"Name\":\"Guide.pdf\",\"Size\":1024,\"IsDir\":false,\"ModTime\":\"2026-11-15T10:00:00Z\"},"\
+              "{\"Path\":\"Antigravity Agent/Antigravity Projects\",\"Name\":\"Antigravity Projects\",\"Size\":0,\"IsDir\":true,\"ModTime\":\"2026-11-15T10:00:00Z\"}]'\n"
+              "      ;;\n"
+              "    \"gdrive:A/Antigravity Agent\")\n"
+              "      echo '[{\"Path\":\"Antigravity Projects\",\"Name\":\"Antigravity Projects\",\"Size\":0,\"IsDir\":true,\"ModTime\":\"2026-11-15T10:00:00Z\"},"\
+              "{\"Path\":\"EmptySubdir\",\"Name\":\"EmptySubdir\",\"Size\":0,\"IsDir\":true,\"ModTime\":\"2026-11-15T10:00:00Z\"},"\
+              "{\"Path\":\"Guide.pdf\",\"Name\":\"Guide.pdf\",\"Size\":1024,\"IsDir\":false,\"ModTime\":\"2026-11-15T10:00:00Z\"}]'\n"
+              "      ;;\n"
+              "    \"gdrive:A/Antigravity Agent/Antigravity Projects\")\n"
+              "      echo '[{\"Path\":\"BLSLLM\",\"Name\":\"BLSLLM\",\"Size\":0,\"IsDir\":true,\"ModTime\":\"2026-11-15T10:00:00Z\"},"\
+              "{\"Path\":\"CONVERSATION_HISTORY.md\",\"Name\":\"CONVERSATION_HISTORY.md\",\"Size\":2048,\"IsDir\":false,\"ModTime\":\"2026-11-15T10:00:00Z\"}]'\n"
+              "      ;;\n"
+              "    *)\n"
+              "      echo '[]'\n"
+              "      ;;\n"
+              "  esac\n"
+              "  exit 0\n"
+              "fi\n"
+              "exit 1\n");
+        QVERIFY(QFile::setPermissions(fakeRclone, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner));
+
+        const QByteArray oldPath = qgetenv("PATH");
+        const QByteArray oldSyncBlocking = qgetenv("WICKFS_SYNC_BLOCKING");
+        auto restoreEnv = qScopeGuard([&]() {
+            qputenv("PATH", oldPath);
+            if (oldSyncBlocking.isEmpty())
+                qunsetenv("WICKFS_SYNC_BLOCKING");
+            else
+                qputenv("WICKFS_SYNC_BLOCKING", oldSyncBlocking);
+        });
+        qputenv("PATH", fakeBinDir.toUtf8() + ":" + oldPath);
+        qputenv("WICKFS_SYNC_BLOCKING", "1");
+
+        const QString cfgPath = dir.path() + "/rclone.conf";
+        write(cfgPath, "[gdrive]\ntype = drive\ntoken = {\"access_token\":\"tok\"}\n");
+
+        Backend b(dir.path() + "/state", dir.path() + "/mnt");
+        b.setRcloneConfigPath(cfgPath);
+        QVERIFY(b.connectRcloneRemote("gdrive"));
+
+        // Selecting folder "A" syncs depth 2 with directories included, so "Antigravity Projects" appears.
+        b.setCurrentFolder("A");
+        FuseMount *vfs = b.fuseMount();
+        QVERIFY(vfs != nullptr);
+
+        int err = 0;
+        const QStringList agentEntries = vfs->handleReaddir("/A/Antigravity Agent", &err);
+        QCOMPARE(err, 0);
+        QVERIFY(agentEntries.contains("Guide.pdf"));
+        QVERIFY(agentEntries.contains("Antigravity Projects"));
+        QVERIFY(agentEntries.contains("EmptySubdir"));
+
+        struct stat st {};
+        QCOMPARE(vfs->handleGetattr("/A/Antigravity Agent/Antigravity Projects", &st), 0);
+        QVERIFY(S_ISDIR(st.st_mode));
+
+        // Opening the deeper subdirectory triggers on-demand readdir sync at depth 3+.
+        const QStringList projectEntries = vfs->handleReaddir("/A/Antigravity Agent/Antigravity Projects", &err);
+        QCOMPARE(err, 0);
+        QVERIFY(projectEntries.contains("BLSLLM"));
+        QVERIFY(projectEntries.contains("CONVERSATION_HISTORY.md"));
+
+        // Periodic root sync must preserve discovered nested subdirectories.
+        b.setCurrentFolder("");
+        b.syncNow();
+        QVERIFY(b.folders().contains("A/Antigravity Agent/Antigravity Projects"));
+        QVERIFY(b.folders().contains("A/Antigravity Agent/Antigravity Projects/BLSLLM"));
+    }
+
+    void renameFilesAndDirectoriesInVfs()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        Backend b(dir.filePath("state"), dir.filePath("mnt"));
+        FuseMount *vfs = b.fuseMount();
+        QVERIFY(vfs != nullptr);
+
+        // Create a new local file (simulating "Untitled Document") and write content.
+        QString localPath;
+        QVERIFY(b.vfsCreateFile("Architecture/Untitled Document", &localPath));
+        const QByteArray payload("Hello rename test\n");
+        QCOMPARE(vfs->handleWriteFile("/Architecture/Untitled Document", payload.constData(), payload.size(), 0),
+                 static_cast<int>(payload.size()));
+
+        // Rename file in place.
+        QCOMPARE(vfs->handleRename("/Architecture/Untitled Document", "/Architecture/Testing.txt", 0), 0);
+        struct stat st {};
+        QCOMPARE(vfs->handleGetattr("/Architecture/Untitled Document", &st), -ENOENT);
+        QCOMPARE(vfs->handleGetattr("/Architecture/Testing.txt", &st), 0);
+        QCOMPARE(b.entryForPath("Architecture/Testing.txt").name, QString("Testing.txt"));
+        QVERIFY(QFileInfo::exists(b.localBlobPath("Architecture/Testing.txt")));
+        QVERIFY(!QFileInfo::exists(b.localBlobPath("Architecture/Untitled Document")));
+
+        char buf[64] {};
+        const int readN = vfs->handleOpenAndRead("/Architecture/Testing.txt", buf, sizeof(buf) - 1, 0);
+        QCOMPARE(readN, payload.size());
+        QCOMPARE(QByteArray(buf, readN), payload);
+
+        // Move file across directories.
+        QCOMPARE(vfs->handleRename("/Architecture/Testing.txt", "/Design/Testing.txt", 0), 0);
+        QCOMPARE(vfs->handleGetattr("/Architecture/Testing.txt", &st), -ENOENT);
+        QCOMPARE(vfs->handleGetattr("/Design/Testing.txt", &st), 0);
+        QCOMPARE(b.entryForPath("Design/Testing.txt").folder, QString("Design"));
+
+        // RENAME_NOREPLACE rejects overwriting an existing file.
+        QCOMPARE(vfs->handleRename("/Design/Testing.txt", "/Design/Brand-Component-Kit.fig", RENAME_NOREPLACE),
+                 -EEXIST);
+
+        // Overwrite without RENAME_NOREPLACE succeeds.
+        QCOMPARE(vfs->handleRename("/Design/Testing.txt", "/Design/Brand-Component-Kit.fig", 0), 0);
+        QCOMPARE(vfs->handleGetattr("/Design/Testing.txt", &st), -ENOENT);
+        QCOMPARE(b.entryForPath("Design/Brand-Component-Kit.fig").sizeBytes, static_cast<qint64>(payload.size()));
+
+        // POSIX error cases.
+        QCOMPARE(vfs->handleRename("/NoSuchFile.txt", "/Other.txt", 0), -ENOENT);
+        QCOMPARE(vfs->handleRename("/Design/Brand-Component-Kit.fig", "/MissingDir/File.txt", 0), -ENOENT);
+        QCOMPARE(vfs->handleRename("/Design/Brand-Component-Kit.fig", "/Architecture", 0), -EISDIR);
+        QCOMPARE(vfs->handleRename("/Architecture", "/Design/Brand-Component-Kit.fig", 0), -ENOTDIR);
+        QCOMPARE(vfs->handleRename("/Architecture", "/Design", 0), -ENOTEMPTY);
+        QCOMPARE(vfs->handleRename("/Architecture", "/Architecture/Sub", 0), -EINVAL);
+        QCOMPARE(vfs->handleRename("/", "/RootRename", 0), -EBUSY);
+        QCOMPARE(vfs->handleRename("/Architecture", "/Architecture2", 0x2 /* RENAME_EXCHANGE */), -EINVAL);
+
+        // Rename an entire directory and verify nested files move with it.
+        QCOMPARE(vfs->handleRename("/Architecture", "/ArchitectureRenamed", 0), 0);
+        QCOMPARE(vfs->handleGetattr("/Architecture", &st), -ENOENT);
+        QCOMPARE(vfs->handleGetattr("/ArchitectureRenamed", &st), 0);
+        QVERIFY(S_ISDIR(st.st_mode));
+
+        int err = 0;
+        const QStringList renamedDirEntries = vfs->handleReaddir("/ArchitectureRenamed", &err);
+        QCOMPARE(err, 0);
+        QVERIFY(renamedDirEntries.contains("Distributed-Cache-Spec.pdf"));
+        QVERIFY(renamedDirEntries.contains("API-Security-Review.md"));
+        QCOMPARE(b.entryForPath("ArchitectureRenamed/Distributed-Cache-Spec.pdf").folder,
+                 QString("ArchitectureRenamed"));
+        QVERIFY(QFileInfo::exists(b.localBlobPath("ArchitectureRenamed/Distributed-Cache-Spec.pdf")));
+    }
+
+    void renameInLocalFolderAndRcloneModes()
+    {
+        // 1. Local source folder mode propagates renames to source folder.
+        {
+            QTemporaryDir dir;
+            QVERIFY(dir.isValid());
+            const QString remoteDir = dir.filePath("remote_cloud");
+            QVERIFY(QDir().mkpath(remoteDir + "/Docs"));
+            write(remoteDir + "/Docs/Draft.txt", "draft body\n");
+
+            Backend b(dir.filePath("state"), dir.filePath("mnt"));
+            QVERIFY(b.connectLocalSource(remoteDir));
+            FuseMount *vfs = b.fuseMount();
+            QVERIFY(vfs != nullptr);
+
+            QCOMPARE(vfs->handleRename("/Docs/Draft.txt", "/Docs/Final.txt", 0), 0);
+            QVERIFY(!QFileInfo::exists(remoteDir + "/Docs/Draft.txt"));
+            QVERIFY(QFileInfo::exists(remoteDir + "/Docs/Final.txt"));
+
+            QCOMPARE(vfs->handleRename("/Docs", "/Archive", 0), 0);
+            QVERIFY(!QFileInfo::exists(remoteDir + "/Docs"));
+            QVERIFY(QFileInfo::exists(remoteDir + "/Archive/Final.txt"));
+        }
+
+        // 2. rclone mode invokes `rclone moveto` for remote files & dirs and allows local-only renames.
+        {
+            QTemporaryDir dir;
+            QVERIFY(dir.isValid());
+            const QString fakeBinDir = dir.path() + "/bin";
+            QVERIFY(QDir().mkpath(fakeBinDir));
+            const QString movetoLog = dir.path() + "/moveto.log";
+            const QString fakeRclone = fakeBinDir + "/rclone";
+
+            write(fakeRclone,
+                  "#!/bin/sh\n"
+                  "if [ \"$1\" = \"listremotes\" ]; then\n"
+                  "  echo \"gdrive:\"\n"
+                  "  exit 0\n"
+                  "fi\n"
+                  "if [ \"$1\" = \"lsjson\" ]; then\n"
+                  "  echo '[{\"Path\":\"Projects\",\"Name\":\"Projects\",\"Size\":0,\"IsDir\":true,\"ModTime\":\"2026-11-15T10:00:00Z\"},"
+                  "{\"Path\":\"Notes.txt\",\"Name\":\"Notes.txt\",\"Size\":12,\"IsDir\":false,\"ModTime\":\"2026-11-15T10:00:00Z\"}]'\n"
+                  "  exit 0\n"
+                  "fi\n"
+                  "if [ \"$1\" = \"moveto\" ]; then\n"
+                  "  src=\"\"; dst=\"\"\n"
+                  "  for a in \"$@\"; do src=\"$dst\"; dst=\"$a\"; done\n"
+                  "  echo \"$src -> $dst\" >> '" + movetoLog.toUtf8() + "'\n"
+                  "  case \"$src\" in\n"
+                  "    *Untitled*)\n"
+                  "      echo \"ERROR : $src: object not found\" >&2\n"
+                  "      exit 3\n"
+                  "      ;;\n"
+                  "  esac\n"
+                  "  exit 0\n"
+                  "fi\n"
+                  "exit 1\n");
+            QVERIFY(QFile::setPermissions(fakeRclone, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner));
+
+            const QByteArray oldPath = qgetenv("PATH");
+            const QByteArray oldSyncBlocking = qgetenv("WICKFS_SYNC_BLOCKING");
+            auto restoreEnv = qScopeGuard([&]() {
+                qputenv("PATH", oldPath);
+                if (oldSyncBlocking.isEmpty())
+                    qunsetenv("WICKFS_SYNC_BLOCKING");
+                else
+                    qputenv("WICKFS_SYNC_BLOCKING", oldSyncBlocking);
+            });
+            qputenv("PATH", fakeBinDir.toUtf8() + ":" + oldPath);
+            qputenv("WICKFS_SYNC_BLOCKING", "1");
+
+            const QString cfgPath = dir.path() + "/rclone.conf";
+            write(cfgPath, "[gdrive]\ntype = drive\ntoken = {\"access_token\":\"tok\"}\n");
+
+            Backend b(dir.path() + "/state", dir.path() + "/mnt");
+            b.setRcloneConfigPath(cfgPath);
+            QVERIFY(b.connectRcloneRemote("gdrive"));
+            FuseMount *vfs = b.fuseMount();
+            QVERIFY(vfs != nullptr);
+
+            // Rename remote cloud-only file & remote directory.
+            QCOMPARE(vfs->handleRename("/Notes.txt", "/NotesRenamed.txt", 0), 0);
+            QCOMPARE(vfs->handleRename("/Projects", "/ProjectsRenamed", 0), 0);
+
+            // Rename locally-created file that is not on the remote yet ("object not found").
+            QString localPath;
+            QVERIFY(b.vfsCreateFile("ProjectsRenamed/Untitled Document", &localPath));
+            QCOMPARE(vfs->handleRename("/ProjectsRenamed/Untitled Document",
+                                       "/ProjectsRenamed/Testing", 0), 0);
+
+            QFile logFile(movetoLog);
+            QVERIFY(logFile.open(QIODevice::ReadOnly));
+            const QString logText = QString::fromUtf8(logFile.readAll());
+            QVERIFY(logText.contains("gdrive:Notes.txt -> gdrive:NotesRenamed.txt"));
+            QVERIFY(logText.contains("gdrive:Projects -> gdrive:ProjectsRenamed"));
+            QVERIFY(logText.contains("gdrive:ProjectsRenamed/Untitled Document -> gdrive:ProjectsRenamed/Testing"));
+
+            struct stat st {};
+            QCOMPARE(vfs->handleGetattr("/ProjectsRenamed/Testing", &st), 0);
+            QCOMPARE(vfs->handleGetattr("/NotesRenamed.txt", &st), 0);
+        }
+    }
+
 private:
     static void write(const QString &path, const QByteArray &contents)
     {
@@ -391,5 +665,5 @@ private:
     }
 };
 
-QTEST_MAIN(GDriveTests)
-#include "gdrive_tests.moc"
+QTEST_MAIN(WickfsTests)
+#include "wickfs_tests.moc"

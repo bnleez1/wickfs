@@ -1,7 +1,7 @@
 {
   "bar.syncing": "Syncing…",
-  "bar.synced": "In Sync",
-  "panel.title": "GDrive Smart Cache",
+  "bar.synced": "WickFS",
+  "panel.title": "WickFS Smart Cache",
   "panel.status.syncing": "Syncing files…",
   "panel.status.synced": "All files in sync",
   "panel.detail.syncing": "Syncing %1 (%2%)",

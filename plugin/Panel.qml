@@ -8,8 +8,8 @@ import "Model.js" as Model
 
 Panel {
   id: root
-  moduleName: "ben.gdrive"
-  ipcTarget: "ben.gdrive"
+  moduleName: "ben.wickfs"
+  ipcTarget: "ben.wickfs"
 
   Commons.Translations {
     id: strings
@@ -27,9 +27,17 @@ Panel {
   readonly property color statusColor: isSyncing ? "#38bdf8" : "#34d399"
   readonly property color pinnedColor: "#818cf8"
 
+  function tr(key, args) {
+    var s = strings.t(key)
+    if (!args) return s
+    for (var i = 0; i < args.length; i++)
+      s = s.replace("%" + (i + 1), String(args[i]))
+    return s
+  }
+
   readonly property string barStatusText: isSyncing
-    ? strings.tr("bar.syncing")
-    : strings.tr("bar.synced")
+    ? root.tr("bar.syncing")
+    : root.tr("bar.synced")
 
   readonly property string cachedText: Model.formatMb(stateData.cachedBytes, Commons.I18n.formatNumber)
   readonly property string maxCacheText: Model.formatMb(stateData.maxCacheBytes, Commons.I18n.formatNumber)
@@ -39,9 +47,9 @@ Panel {
     if (isSyncing) {
       var pct = Commons.I18n.formatNumber(Math.round((stateData.syncProgress || 0.45) * 100), 0)
       var file = Model.sanitizeText(stateData.activeSyncFile || "Drive", 42)
-      return strings.tr("panel.detail.syncing", [file, pct])
+      return root.tr("panel.detail.syncing", [file, pct])
     }
-    return strings.tr("panel.detail.synced", [
+    return root.tr("panel.detail.synced", [
       Commons.I18n.formatNumber(stateData.cachedFiles, 0),
       Commons.I18n.formatNumber(stateData.totalFiles, 0)
     ])
@@ -51,9 +59,9 @@ Panel {
     if (!stateProc.running) stateProc.running = true
   }
 
-  function openGdriveApp() {
+  function openWickfsApp() {
     if (root.bar) {
-      root.bar.run("/home/ben/.local/bin/gdrive")
+      root.bar.run("sh -c 'exec \"$(command -v wickfs || echo \"$HOME/.local/bin/wickfs\")\"'")
     } else if (!appProc.running) {
       appProc.running = true
     }
@@ -78,7 +86,7 @@ Panel {
     id: stateProc
     command: [
       "sh", "-c",
-      "cat \"$HOME/.local/share/gdrive/state.json\" 2>/dev/null || true"
+      "cat \"$HOME/.local/share/wickfs/state.json\" 2>/dev/null || true"
     ]
     stdout: StdioCollector {
       waitForEnd: true
@@ -90,19 +98,19 @@ Panel {
 
   Process {
     id: syncProc
-    command: ["sh", "-c", "\"$HOME/.local/bin/gdrive\" sync >/dev/null 2>&1 || gdrive sync >/dev/null 2>&1"]
+    command: ["sh", "-c", "wickfs sync >/dev/null 2>&1 || \"$HOME/.local/bin/wickfs\" sync >/dev/null 2>&1"]
     onExited: root.refresh()
   }
 
   Process {
     id: evictProc
-    command: ["sh", "-c", "\"$HOME/.local/bin/gdrive\" evict --cold >/dev/null 2>&1 || gdrive evict --cold >/dev/null 2>&1"]
+    command: ["sh", "-c", "wickfs evict --cold >/dev/null 2>&1 || \"$HOME/.local/bin/wickfs\" evict --cold >/dev/null 2>&1"]
     onExited: root.refresh()
   }
 
   Process {
     id: appProc
-    command: ["sh", "-c", "\"$HOME/.local/bin/gdrive\" >/dev/null 2>&1 &"]
+    command: ["sh", "-c", "(wickfs || \"$HOME/.local/bin/wickfs\") >/dev/null 2>&1 &"]
   }
 
   Timer {
@@ -126,13 +134,13 @@ Panel {
     tooltipText: root.opened
       ? ""
       : Model.sanitizeText(
-          strings.tr("panel.title") + " — " + root.barStatusText + " (" + root.cachedText + " / " + root.maxCacheText + ")",
+          root.tr("panel.title") + " — " + root.barStatusText + " (" + root.cachedText + " / " + root.maxCacheText + ")",
           140
         )
 
     onPressed: function(b) {
       if (b === Qt.RightButton) root.triggerSync()
-      else if (b === Qt.MiddleButton) root.openGdriveApp()
+      else if (b === Qt.MiddleButton) root.openWickfsApp()
       else root.toggle()
     }
 
@@ -240,7 +248,7 @@ Panel {
       implicitHeight: column.implicitHeight
 
       onActivateRequested: {
-        root.openGdriveApp()
+        root.openWickfsApp()
         root.close()
       }
       onCloseRequested: root.close()
@@ -296,7 +304,7 @@ Panel {
             spacing: Style.space(2)
 
             Text {
-              text: strings.tr("panel.title")
+              text: root.tr("panel.title")
               textFormat: Text.PlainText
               color: root.foreground
               font.family: root.fontFamily
@@ -307,7 +315,7 @@ Panel {
             }
 
             Text {
-              text: root.isSyncing ? strings.tr("panel.status.syncing") : strings.tr("panel.status.synced")
+              text: root.isSyncing ? root.tr("panel.status.syncing") : root.tr("panel.status.synced")
               textFormat: Text.PlainText
               color: root.statusColor
               font.family: root.fontFamily
@@ -323,13 +331,13 @@ Panel {
             anchors.right: parent.right
             anchors.verticalCenter: parent.verticalCenter
             iconText: "\udb80\udd8d"
-            tooltipText: strings.tr("panel.action.open")
+            tooltipText: root.tr("panel.action.open")
             foreground: root.foreground
             hoverColor: root.statusColor
             fontFamily: root.fontFamily
             bordered: true
             onClicked: {
-              root.openGdriveApp()
+              root.openWickfsApp()
               root.close()
             }
           }
@@ -391,7 +399,7 @@ Panel {
                 Text {
                   id: syncBtnLbl
                   anchors.centerIn: parent
-                  text: strings.tr("panel.action.sync")
+                  text: root.tr("panel.action.sync")
                   textFormat: Text.PlainText
                   color: root.statusColor
                   font.family: root.fontFamily
@@ -417,7 +425,7 @@ Panel {
                 Text {
                   id: evictBtnLbl
                   anchors.centerIn: parent
-                  text: strings.tr("panel.action.evict")
+                  text: root.tr("panel.action.evict")
                   textFormat: Text.PlainText
                   color: root.foreground
                   font.family: root.fontFamily
@@ -452,7 +460,7 @@ Panel {
             Row {
               width: parent.width
               Text {
-                text: strings.tr("panel.cache.header")
+                text: root.tr("panel.cache.header")
                 textFormat: Text.PlainText
                 color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.65)
                 font.family: root.fontFamily
@@ -487,7 +495,7 @@ Panel {
             }
 
             Text {
-              text: strings.tr("panel.cache.saved", [
+              text: root.tr("panel.cache.saved", [
                 Commons.I18n.formatNumber(root.stateData.savedPct, 0),
                 root.savedText
               ])
@@ -501,7 +509,7 @@ Panel {
 
         // File Sync & Residency List
         Text {
-          text: strings.tr("panel.files.header")
+          text: root.tr("panel.files.header")
           textFormat: Text.PlainText
           color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.65)
           font.family: root.fontFamily
@@ -552,8 +560,8 @@ Panel {
                 Text {
                   id: fileBadge
                   text: modelData.pinned
-                    ? strings.tr("panel.badge.pinned")
-                    : (modelData.state === "cached" ? strings.tr("panel.badge.cached") : strings.tr("panel.badge.cloud"))
+                    ? root.tr("panel.badge.pinned")
+                    : (modelData.state === "cached" ? root.tr("panel.badge.cached") : root.tr("panel.badge.cloud"))
                   textFormat: Text.PlainText
                   color: modelData.state === "cloud"
                     ? Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.55)

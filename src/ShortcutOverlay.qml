@@ -39,7 +39,7 @@ Popup {
         { keys: "/", desc: qsTr("Focus search bar") },
         { keys: "Ctrl+Z / Ctrl+Shift+Z", desc: qsTr("Undo / Redo cache or pin action") },
         { keys: "? / F1", desc: qsTr("Show or hide keyboard shortcuts") },
-        { keys: "Q / Ctrl+Q", desc: qsTr("Quit GDrive") }
+        { keys: "Q / Ctrl+Q", desc: qsTr("Quit WickFS") }
     ]
 
     contentItem: ColumnLayout {

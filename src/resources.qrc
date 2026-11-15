@@ -5,7 +5,7 @@
         <file alias="BudgetDialog.qml">BudgetDialog.qml</file>
         <file alias="ConnectDialog.qml">ConnectDialog.qml</file>
         <file alias="SyncStatusPanel.qml">SyncStatusPanel.qml</file>
-        <file alias="gdrive.svg">../pkgbuild/gdrive.svg</file>
+        <file alias="wickfs.svg">../pkgbuild/wickfs.svg</file>
         <file alias="skill/SKILL.md">skill/SKILL.md</file>
         <file alias="plugin/manifest.json">../plugin/manifest.json</file>
         <file alias="plugin/Model.js">../plugin/Model.js</file>

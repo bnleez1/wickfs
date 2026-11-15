@@ -10,10 +10,24 @@
 #include <QJsonObject>
 #include <QProcess>
 #include <QSaveFile>
+#include <QSocketNotifier>
 #include <QTimer>
+#include <csignal>
 #include <cstdio>
+#include <sys/socket.h>
+#include <unistd.h>
 
 namespace {
+
+int s_sigFd[2] = {-1, -1};
+
+void handleTermSignal(int) {
+    char b = 1;
+    if (s_sigFd[0] >= 0) {
+        const ssize_t ignored = ::write(s_sigFd[0], &b, sizeof(b));
+        (void)ignored;
+    }
+}
 
 void printErr(const QString &msg, bool json) {
     if (json) {
@@ -32,52 +46,67 @@ void printOut(const QJsonObject &o) {
 
 void printUsage() {
     std::fprintf(stdout,
-        "gdrive — Smart on-demand Google Drive virtual filesystem & LFU/LRU cache manager\n\n"
+        "wickfs — Smart on-demand Google Drive virtual filesystem & LFU/LRU cache manager\n\n"
         "Usage:\n"
-        "  gdrive [open] [manifest.json|folder]                        Open the desktop app\n"
-        "  gdrive check [--json]                                       Verify FUSE3, rclone, and cache readiness\n"
-        "  gdrive status [--state-dir DIR] [--json]                    Show cache usage, disk budget, and file counts\n"
-        "  gdrive ls [--filter all|frequent|pinned|cached|cloud] [--json]\n"
-        "  gdrive access <path> [--state-dir DIR] [--json]             Hydrate file on-demand & record access\n"
-        "  gdrive pin <path> [--state-dir DIR] [--json]                Pin file offline (never evicted)\n"
-        "  gdrive unpin <path> [--state-dir DIR] [--json]              Return pinned file to smart cache\n"
-        "  gdrive evict [<path>|--cold] [--state-dir DIR] [--json]     Evict a file or all cold cached files\n"
-        "  gdrive budget [--max-mb N] [--min-free-gb N] [--threshold N] [--json]\n"
-        "  gdrive sync [--remote NAME] [--folder DIR] [--json]         Sync catalog & enforce cache budget\n"
-        "  gdrive auth [status|setup] [--client-id ID] [--client-secret S] [--import-json FILE] [--json]\n"
-        "  gdrive daemon [--once] [--json]                             Run background sync & standby-wake daemon\n"
-        "  gdrive autostart [enable|status] [--json]                   Configure auto-start on boot & wake from standby\n"
-        "  gdrive plugin install [--json]                              Install the Omarchy top-bar sync widget (ben.gdrive)\n"
-        "  gdrive skill install [--json]                               Install the gdrive agent skill\n"
-        "  gdrive --help                                               Show this help\n");
+        "  wickfs [open] [manifest.json|folder]                        Open the desktop app\n"
+        "  wickfs check [--json]                                       Verify FUSE3, rclone, and cache readiness\n"
+        "  wickfs status [--state-dir DIR] [--json]                    Show cache usage, disk budget, and file counts\n"
+        "  wickfs ls [--filter all|frequent|pinned|cached|cloud] [--json]\n"
+        "  wickfs access <path> [--state-dir DIR] [--json]             Hydrate file on-demand & record access\n"
+        "  wickfs pin <path> [--state-dir DIR] [--json]                Pin file offline (never evicted)\n"
+        "  wickfs unpin <path> [--state-dir DIR] [--json]              Return pinned file to smart cache\n"
+        "  wickfs evict [<path>|--cold] [--state-dir DIR] [--json]     Evict a file or all cold cached files\n"
+        "  wickfs budget [--max-mb N] [--min-free-gb N] [--threshold N] [--json]\n"
+        "  wickfs sync [--remote NAME] [--folder DIR] [--json]         Sync catalog & enforce cache budget\n"
+        "  wickfs auth [status|setup] [--client-id ID] [--client-secret S] [--import-json FILE] [--json]\n"
+        "  wickfs daemon [--once] [--json]                             Run background sync & standby-wake daemon\n"
+        "  wickfs autostart [enable|status] [--json]                   Configure auto-start on boot & wake from standby\n"
+        "  wickfs plugin install [--json]                              Install the Omarchy top-bar sync widget (ben.wickfs)\n"
+        "  wickfs skill install [--json]                               Install the wickfs agent skill\n"
+        "  wickfs --help                                               Show this help\n");
 }
 
 int cmdAutostart(const QString &subcmd, bool json) {
     const QString home = QDir::homePath();
     const QString systemdUserDir = home + "/.config/systemd/user";
-    const QString servicePath = systemdUserDir + "/gdrive.service";
+    const QString servicePath = systemdUserDir + "/wickfs.service";
     const QString defaultWantsDir = systemdUserDir + "/default.target.wants";
     const QString graphicalWantsDir = systemdUserDir + "/graphical-session.target.wants";
     const QString postBootHookDir = home + "/.config/omarchy/hooks/post-boot.d";
-    const QString postBootHookPath = postBootHookDir + "/gdrive-sync";
+    const QString postBootHookPath = postBootHookDir + "/wickfs-sync";
 
     if (subcmd == "enable" || subcmd.isEmpty()) {
         QDir().mkpath(defaultWantsDir);
         QDir().mkpath(graphicalWantsDir);
         QDir().mkpath(postBootHookDir);
 
+        // Remove legacy gdrive unit/hook files if migrating from the old name.
+        QFile::remove(defaultWantsDir + "/gdrive.service");
+        QFile::remove(graphicalWantsDir + "/gdrive.service");
+        QFile::remove(systemdUserDir + "/gdrive.service");
+        QFile::remove(postBootHookDir + "/gdrive-sync");
+
+        const QString execBin = QFileInfo::exists("/usr/bin/wickfs")
+            ? QStringLiteral("/usr/bin/wickfs")
+            : (QFileInfo::exists(QCoreApplication::applicationFilePath())
+                ? QCoreApplication::applicationFilePath()
+                : QStringLiteral("%h/.local/bin/wickfs"));
+
         const QByteArray serviceContent =
-            "[Unit]\n"
-            "Description=GDrive Smart Cache FUSE3 Daemon & Standby Wake Sync\n"
-            "After=network-online.target dbus.socket graphical-session.target\n"
-            "Wants=network-online.target\n\n"
-            "[Service]\n"
-            "Type=simple\n"
-            "ExecStart=%h/.local/bin/gdrive daemon\n"
-            "Restart=always\n"
-            "RestartSec=3\n\n"
-            "[Install]\n"
-            "WantedBy=default.target graphical-session.target\n";
+            QStringLiteral(
+                "[Unit]\n"
+                "Description=WickFS Smart Cache FUSE3 Daemon & Standby Wake Sync\n"
+                "After=network-online.target dbus.socket graphical-session.target\n"
+                "Wants=network-online.target\n\n"
+                "[Service]\n"
+                "Type=simple\n"
+                "ExecStart=%1 daemon\n"
+                "Restart=always\n"
+                "RestartSec=3\n\n"
+                "[Install]\n"
+                "WantedBy=default.target graphical-session.target\n")
+            .arg(execBin)
+            .toUtf8();
 
         QSaveFile svcOut(servicePath);
         if (svcOut.open(QIODevice::WriteOnly)) {
@@ -85,15 +114,15 @@ int cmdAutostart(const QString &subcmd, bool json) {
             svcOut.commit();
         }
 
-        QFile::remove(defaultWantsDir + "/gdrive.service");
-        QFile::link(servicePath, defaultWantsDir + "/gdrive.service");
-        QFile::remove(graphicalWantsDir + "/gdrive.service");
-        QFile::link(servicePath, graphicalWantsDir + "/gdrive.service");
+        QFile::remove(defaultWantsDir + "/wickfs.service");
+        QFile::link(servicePath, defaultWantsDir + "/wickfs.service");
+        QFile::remove(graphicalWantsDir + "/wickfs.service");
+        QFile::link(servicePath, graphicalWantsDir + "/wickfs.service");
 
         const QByteArray hookContent =
             "#!/bin/bash\n"
-            "# Ensure GDrive Smart Cache daemon is active and synced after boot\n"
-            "systemctl --user start gdrive.service 2>/dev/null || \"$HOME/.local/bin/gdrive\" sync >/dev/null 2>&1 &\n";
+            "# Ensure WickFS Smart Cache daemon is active and synced after boot\n"
+            "systemctl --user start wickfs.service 2>/dev/null || wickfs sync >/dev/null 2>&1 || \"$HOME/.local/bin/wickfs\" sync >/dev/null 2>&1 &\n";
 
         QSaveFile hookOut(postBootHookPath);
         if (hookOut.open(QIODevice::WriteOnly)) {
@@ -131,33 +160,16 @@ int cmdAutostart(const QString &subcmd, bool json) {
 }
 
 int cmdPluginInstall(bool json) {
-    const QString destDir = QDir::homePath() + "/.config/omarchy/plugins/ben.gdrive";
-    QDir().mkpath(destDir + "/i18n");
-    const QStringList relFiles = {
-        "manifest.json",
-        "Model.js",
-        "Panel.qml",
-        "i18n/en.json",
-        "i18n/da.json"
-    };
-    for (const QString &rel : relFiles) {
-        QFile src(":/plugin/" + rel);
-        if (!src.open(QIODevice::ReadOnly)) {
-            printErr("Bundled plugin resource missing: " + rel, json);
-            return 1;
-        }
-        const QByteArray data = src.readAll();
-        const QString destPath = destDir + "/" + rel;
-        QSaveFile out(destPath);
-        if (!out.open(QIODevice::WriteOnly) || out.write(data) != data.size() || !out.commit()) {
-            printErr("Failed to write plugin file to " + destPath, json);
-            return 1;
-        }
+    QString destDir;
+    QString err;
+    if (!Backend::installBarPlugin(true, &destDir, &err)) {
+        printErr(err, json);
+        return 1;
     }
     if (json) {
-        printOut({{"ok", true}, {"pluginId", "ben.gdrive"}, {"path", destDir}});
+        printOut({{"ok", true}, {"pluginId", "ben.wickfs"}, {"path", destDir}});
     } else {
-        std::fprintf(stdout, "Installed Omarchy bar widget plugin (ben.gdrive) to %s\n",
+        std::fprintf(stdout, "Installed Omarchy bar widget plugin (ben.wickfs) to %s\n",
                      destDir.toUtf8().constData());
     }
     return 0;
@@ -170,7 +182,7 @@ int cmdSkillInstall(bool json) {
         return 1;
     }
     const QByteArray data = src.readAll();
-    const QString destDir = QDir::homePath() + "/.agents/skills/gdrive";
+    const QString destDir = QDir::homePath() + "/.agents/skills/wickfs";
     QDir().mkpath(destDir);
     const QString destPath = destDir + "/SKILL.md";
     QSaveFile out(destPath);
@@ -178,6 +190,7 @@ int cmdSkillInstall(bool json) {
         printErr("Failed to write skill to " + destPath, json);
         return 1;
     }
+    QDir(QDir::homePath() + "/.agents/skills/gdrive").removeRecursively();
     if (json) {
         printOut({{"ok", true}, {"path", destPath}});
     } else {
@@ -226,7 +239,7 @@ int runCli(int argc, char *argv[]) {
     qputenv("QT_QPA_PLATFORM", "offscreen");
     qunsetenv("QT_QPA_PLATFORMTHEME");
     QGuiApplication app(argc, argv);
-    app.setApplicationName("gdrive");
+    app.setApplicationName("wickfs");
     app.setApplicationVersion("0.1.0");
 
     const QStringList args = app.arguments();
@@ -238,19 +251,19 @@ int runCli(int argc, char *argv[]) {
         return 0;
     }
     if (cmd == "--version" || cmd == "-v") {
-        std::fprintf(stdout, "gdrive 0.1.0\n");
+        std::fprintf(stdout, "wickfs 0.1.0\n");
         return 0;
     }
     if (cmd == "skill") {
         if (args.value(2) == "install")
             return cmdSkillInstall(json);
-        printErr("Usage: gdrive skill install [--json]", json);
+        printErr("Usage: wickfs skill install [--json]", json);
         return 1;
     }
     if (cmd == "plugin") {
         if (args.value(2) == "install")
             return cmdPluginInstall(json);
-        printErr("Usage: gdrive plugin install [--json]", json);
+        printErr("Usage: wickfs plugin install [--json]", json);
         return 1;
     }
     if (cmd == "autostart") {
@@ -258,7 +271,14 @@ int runCli(int argc, char *argv[]) {
         return cmdAutostart(sub, json);
     }
 
+    if (cmd != "daemon" || args.contains("--once"))
+        qputenv("WICKFS_SYNC_BLOCKING", "1");
+
     const QString stateDir = extractOption(args, "--state-dir");
+    if (cmd == "daemon" && stateDir.isEmpty() && !args.contains("--once")) {
+        qputenv("WICKFS_ENABLE_FUSE", "1");
+        qputenv("WICKFS_OWNER_FUSE", "1");
+    }
     const QString mountDir = stateDir.isEmpty() ? QString() : (stateDir + "/mnt");
     Backend backend(stateDir, mountDir);
 
@@ -377,7 +397,7 @@ int runCli(int argc, char *argv[]) {
     if (cmd == "access") {
         const QString target = extractPositional(args);
         if (target.isEmpty()) {
-            printErr("Usage: gdrive access <path> [--json]", json);
+            printErr("Usage: wickfs access <path> [--json]", json);
             return 1;
         }
         QString err;
@@ -407,7 +427,7 @@ int runCli(int argc, char *argv[]) {
     if (cmd == "pin" || cmd == "unpin") {
         const QString target = extractPositional(args);
         if (target.isEmpty()) {
-            printErr(QStringLiteral("Usage: gdrive %1 <path> [--json]").arg(cmd), json);
+            printErr(QStringLiteral("Usage: wickfs %1 <path> [--json]").arg(cmd), json);
             return 1;
         }
         const bool pinVal = (cmd == "pin");
@@ -591,7 +611,7 @@ int runCli(int argc, char *argv[]) {
                     {"autoStartEnabled", backend.autoStartEnabled()}
                 });
             } else {
-                std::fprintf(stdout, "gdrive daemon initialized: mounted=%s, files=%d, state=%s\n",
+                std::fprintf(stdout, "wickfs daemon initialized: mounted=%s, files=%d, state=%s\n",
                              backend.mounted() ? "yes" : "no",
                              backend.totalFileCount(),
                              backend.syncState().toUtf8().constData());
@@ -628,7 +648,21 @@ int runCli(int argc, char *argv[]) {
             QStringLiteral("type='signal',sender='org.freedesktop.login1',interface='org.freedesktop.login1.Manager',member='PrepareForSleep'")
         });
 
-        std::fprintf(stdout, "gdrive daemon running (mount=%s, standby-wake listener=active)\n",
+        QSocketNotifier *sigNotifier = nullptr;
+        if (::socketpair(AF_UNIX, SOCK_STREAM, 0, s_sigFd) == 0) {
+            std::signal(SIGTERM, handleTermSignal);
+            std::signal(SIGINT, handleTermSignal);
+            sigNotifier = new QSocketNotifier(s_sigFd[1], QSocketNotifier::Read, &app);
+            QObject::connect(sigNotifier, &QSocketNotifier::activated, &app, [&app, sigNotifier]() {
+                sigNotifier->setEnabled(false);
+                char tmp = 0;
+                const ssize_t ignored = ::read(s_sigFd[1], &tmp, sizeof(tmp));
+                (void)ignored;
+                app.quit();
+            });
+        }
+
+        std::fprintf(stdout, "wickfs daemon running (mount=%s, standby-wake listener=active)\n",
                      backend.mountPoint().toUtf8().constData());
         std::fflush(stdout);
         return app.exec();

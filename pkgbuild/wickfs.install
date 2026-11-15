@@ -1,0 +1,41 @@
+_install_plugin_for_user() {
+  local user="$1"
+  local home_dir="$2"
+  local omarchy_dir="$home_dir/.config/omarchy"
+  [ -d "$omarchy_dir" ] || return 0
+
+  local dest="$omarchy_dir/plugins/ben.wickfs"
+  mkdir -p "$dest/i18n"
+  install -m644 /usr/share/wickfs/plugin/manifest.json "$dest/manifest.json"
+  install -m644 /usr/share/wickfs/plugin/Model.js "$dest/Model.js"
+  install -m644 /usr/share/wickfs/plugin/Panel.qml "$dest/Panel.qml"
+  install -m644 /usr/share/wickfs/plugin/i18n/en.json "$dest/i18n/en.json"
+  install -m644 /usr/share/wickfs/plugin/i18n/da.json "$dest/i18n/da.json"
+
+  rm -rf "$omarchy_dir/plugins/ben.gdrive"
+
+  if [ -n "$user" ] && [ "$(id -u)" -eq 0 ]; then
+    local grp
+    grp="$(id -gn "$user" 2>/dev/null || echo "$user")"
+    chown -R "$user:$grp" "$dest"
+  fi
+}
+
+post_install() {
+  if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+    local uhome
+    uhome="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+    [ -n "$uhome" ] && _install_plugin_for_user "$SUDO_USER" "$uhome"
+  else
+    for uhome in /home/*; do
+      [ -d "$uhome/.config/omarchy" ] || continue
+      local uname
+      uname="$(basename "$uhome")"
+      _install_plugin_for_user "$uname" "$uhome"
+    done
+  fi
+}
+
+post_upgrade() {
+  post_install
+}

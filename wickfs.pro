@@ -2,7 +2,7 @@ QT += core gui qml quick quickcontrols2 dbus network
 
 CONFIG += c++17 release link_pkgconfig
 PKGCONFIG += fuse3
-TARGET = gdrive
+TARGET = wickfs
 TEMPLATE = app
 
 HEADERS += \

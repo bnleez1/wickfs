@@ -1,4 +1,4 @@
-pkgname=gdrive
+pkgname=wickfs
 pkgver=0.1.0
 pkgrel=1
 pkgdesc='Smart on-demand Google Drive virtual filesystem and LFU/LRU disk cache'
@@ -7,6 +7,7 @@ license=('MIT')
 depends=('qt6-base' 'qt6-declarative' 'qt6-wayland' 'fuse3' 'xdg-desktop-portal')
 optdepends=('rclone: Google Drive OAuth and remote synchronization')
 makedepends=('gcc' 'make')
+install=wickfs.install
 source=()
 sha256sums=()
 
@@ -17,9 +18,16 @@ build() {
 
 package() {
   cd "$startdir/.."
-  install -Dm755 build/gdrive "$pkgdir/usr/bin/gdrive"
+  install -Dm755 build/wickfs "$pkgdir/usr/bin/wickfs"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
-  install -Dm644 "$startdir/gdrive.svg" "$pkgdir/usr/share/icons/hicolor/scalable/apps/gdrive.svg"
-  install -Dm644 "$startdir/gdrive.desktop" "$pkgdir/usr/share/applications/gdrive.desktop"
-  install -Dm644 "$startdir/gdrive.service" "$pkgdir/usr/lib/systemd/user/gdrive.service"
+  install -Dm644 "$startdir/wickfs.svg" "$pkgdir/usr/share/icons/hicolor/scalable/apps/wickfs.svg"
+  install -Dm644 "$startdir/wickfs.desktop" "$pkgdir/usr/share/applications/wickfs.desktop"
+  install -Dm644 "$startdir/wickfs.service" "$pkgdir/usr/lib/systemd/user/wickfs.service"
+
+  # Bundle the Omarchy bar panel widget so installing the package installs the widget.
+  install -Dm644 plugin/manifest.json "$pkgdir/usr/share/wickfs/plugin/manifest.json"
+  install -Dm644 plugin/Model.js "$pkgdir/usr/share/wickfs/plugin/Model.js"
+  install -Dm644 plugin/Panel.qml "$pkgdir/usr/share/wickfs/plugin/Panel.qml"
+  install -Dm644 plugin/i18n/en.json "$pkgdir/usr/share/wickfs/plugin/i18n/en.json"
+  install -Dm644 plugin/i18n/da.json "$pkgdir/usr/share/wickfs/plugin/i18n/da.json"
 }

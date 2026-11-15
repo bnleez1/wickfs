@@ -44,7 +44,7 @@ Popup {
         }
 
         Label {
-            text: qsTr("GDrive keeps frequently accessed and pinned files on local disk while evicting cold files back to 0-byte cloud stubs whenever the cache exceeds your budget.")
+            text: qsTr("WickFS keeps frequently accessed and pinned files on local disk while evicting cold files back to 0-byte cloud stubs whenever the cache exceeds your budget.")
             font.pixelSize: 13
             color: theme.textSecondary
             wrapMode: Text.WordWrap

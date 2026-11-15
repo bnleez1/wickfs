@@ -4,4 +4,10 @@ set -eu
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 "$ROOT/bin/build"
 cd "$ROOT/pkgbuild"
-exec makepkg -fsi "$@"
+makepkg -fsi "$@"
+
+if [ -x /usr/bin/wickfs ]; then
+  /usr/bin/wickfs plugin install || true
+elif [ -x "$ROOT/build/wickfs" ]; then
+  "$ROOT/build/wickfs" plugin install || true
+fi

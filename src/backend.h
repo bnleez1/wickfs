@@ -7,11 +7,14 @@
 #include <QObject>
 #include <QProcess>
 #include <QRecursiveMutex>
+#include <QSet>
 #include <QString>
 #include <QStringList>
 #include <QTimer>
 #include <QVariantList>
 #include <QVariantMap>
+
+#include <atomic>
 
 class FilePicker;
 class FuseMount;
@@ -318,11 +321,13 @@ public slots:
     // Thread-safe VFS operations called by FuseMount and tests
     bool vfsStat(const QString &relPath, qint64 *sizeOut, qint64 *mtimeSecsOut,
                  bool *isDirOut, bool *isResidentOut) const;
-    QStringList vfsReadDir(const QString &relDirPath, bool *existsOut = nullptr) const;
+    Q_INVOKABLE bool vfsIsCloudOnly(const QString &relPath) const;
+    QStringList vfsReadDir(const QString &relDirPath, bool *existsOut = nullptr, bool allowRemoteSync = true);
     QString vfsOpenAndHydrate(const QString &relPath, bool forWrite, QString *errorOut = nullptr);
     bool vfsCreateFile(const QString &relPath, QString *localCachePathOut);
     bool vfsWriteCompleted(const QString &relPath);
     bool vfsUnlinkFile(const QString &relPath);
+    int vfsRename(const QString &oldRelPath, const QString &newRelPath, unsigned int flags = 0);
 
     FuseMount *fuseMount() const { return m_fuseMount; }
     QList<DriveFileEntry> allEntries() const;
@@ -332,6 +337,8 @@ public slots:
     static QString formatSize(qint64 bytes);
     static double computeHotScore(int accessCount, qint64 lastAccessedSecs,
                                   qint64 nowSecs, int halfLifeHours);
+    static bool installBarPlugin(bool enableInBar = true, QString *destDirOut = nullptr,
+                                 QString *errorOut = nullptr);
 
 signals:
     void statsChanged();
@@ -358,7 +365,16 @@ private:
     void pushUndoSnapshot(const QString &description);
     void applySnapshot(const SnapshotState &snap);
     bool fetchFromRcloneLocked(const DriveFileEntry &entry, const QString &destBlobPath, QString *errorOut) const;
+    static bool fetchFromRclonePath(const QString &rcloneBin, const QString &remoteName,
+                                    const QString &remotePath, const QString &relPath,
+                                    const QString &destBlobPath, QString *errorOut);
     QByteArray synthesizePayloadForEntry(const DriveFileEntry &entry) const;
+    void syncRemoteFolder(const QString &folder);
+    void startAsyncRcloneSync(const QString &folderOnly = {});
+    void mergeRcloneRootJsonLocked(const QByteArray &rootJson);
+    void mergeRcloneFolderJsonLocked(const QString &baseFolder, const QByteArray &folderJson,
+                                     bool pruneDirectChildren = false);
+    void rebuildVfsIndexLocked() const;
 
     mutable QRecursiveMutex m_mutex;
     QString m_stateDir;
@@ -387,6 +403,15 @@ private:
     QString m_localSourceDir;
     QString m_rcloneConfigPath;
     QStringList m_availableRemotes;
+    QStringList m_remoteFolders;
+    QHash<QString, qint64> m_syncedDirTimestampsMs;
+    mutable QHash<QString, int> m_vfsFileIdx;
+    mutable QHash<QString, QStringList> m_vfsDirChildren;
+    mutable QSet<QString> m_vfsDirs;
+    std::atomic<bool> m_rcloneSyncInFlight{false};
+    mutable qint64 m_lastLoadedStateMtimeMs = 0;
+    mutable qint64 m_lastLoadedStateSize = 0;
+    QTimer m_stateWatchTimer;
     bool m_oauthAuthorized = false;
     QString m_oauthClientId;
     QString m_oauthClientSecret;

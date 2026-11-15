@@ -10,7 +10,7 @@ ApplicationWindow {
     minimumWidth: 780
     minimumHeight: 540
     visible: true
-    title: qsTr("GDrive")
+    title: qsTr("WickFS")
     color: theme.windowBg
 
     Material.theme: Material.Dark
@@ -242,7 +242,7 @@ ApplicationWindow {
 
                         Label {
                             anchors.centerIn: parent
-                            text: "GD"
+                            text: "WF"
                             font.pixelSize: 14
                             font.bold: true
                             color: theme.accentForeground
@@ -252,7 +252,7 @@ ApplicationWindow {
                     ColumnLayout {
                         spacing: 1
                         Label {
-                            text: qsTr("GDrive Smart Cache")
+                            text: qsTr("WickFS Smart Cache")
                             font.pixelSize: 16
                             font.bold: true
                             color: theme.textPrimary

@@ -29,6 +29,7 @@ public:
     bool isKernelFuse() const { return m_kernelFuse.load(); }
     QString mountPoint() const { return m_mountPoint; }
     QString lastError() const { return m_lastError; }
+    static bool isExternalFuseMounted(const QString &mountPoint);
 
     // Direct VFS entry points used by both the libfuse3 callbacks and unit tests.
     int handleGetattr(const char *path, struct stat *stbuf);
@@ -36,6 +37,7 @@ public:
     int handleOpenAndRead(const char *path, char *buf, size_t size, off_t offset);
     int handleWriteFile(const char *path, const char *buf, size_t size, off_t offset);
     int handleUnlink(const char *path);
+    int handleRename(const char *oldPath, const char *newPath, unsigned int flags = 0);
 
     Backend *backend() const { return m_backend; }
 
@@ -51,5 +53,6 @@ private:
     std::thread m_thread;
     std::atomic<bool> m_mounted{false};
     std::atomic<bool> m_kernelFuse{false};
+    std::atomic<bool> m_ownsFuse{false};
     mutable std::mutex m_lifecycleMutex;
 };

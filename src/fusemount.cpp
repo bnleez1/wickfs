@@ -10,11 +10,39 @@
 #include <QProcess>
 #include <QStandardPaths>
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <fcntl.h>
+#include <sys/statvfs.h>
 #include <unistd.h>
 
 namespace {
+
+bool isBackgroundIndexerOrThumbnailer(pid_t pid) {
+    if (pid <= 1)
+        return false;
+    QFile comm(QStringLiteral("/proc/%1/comm").arg(pid));
+    if (comm.open(QIODevice::ReadOnly)) {
+        const QString name = QString::fromUtf8(comm.readAll()).trimmed().toLower();
+        static const QStringList kSkipPrefixes = {
+            QStringLiteral("glycin"),
+            QStringLiteral("bwrap"),
+            QStringLiteral("tumblerd"),
+            QStringLiteral("tracker"),
+            QStringLiteral("localsearch"),
+            QStringLiteral("gdk-pixbuf"),
+            QStringLiteral("totem-video"),
+            QStringLiteral("evince-thumb"),
+            QStringLiteral("ffmpegthumb"),
+            QStringLiteral("gsf-office")
+        };
+        for (const QString &pfx : kSkipPrefixes) {
+            if (name.startsWith(pfx))
+                return true;
+        }
+    }
+    return false;
+}
 
 QString normalizeRelPath(const char *rawPath) {
     if (!rawPath)
@@ -65,6 +93,15 @@ int fuseOpenCb(const char *path, struct fuse_file_info *fi) {
 
     const QString rel = normalizeRelPath(path);
     const bool forWrite = ((fi->flags & O_ACCMODE) != O_RDONLY);
+
+    // Do not block Nautilus/file-manager folder browsing by downloading remote
+    // cloud-only blobs when a background thumbnailer or desktop indexer opens them.
+    if (!forWrite) {
+        struct fuse_context *ctx = fuse_get_context();
+        if (ctx && isBackgroundIndexerOrThumbnailer(ctx->pid) && m->backend()->vfsIsCloudOnly(rel))
+            return -ENODATA;
+    }
+
     QString err;
     const QString localPath = m->backend()->vfsOpenAndHydrate(rel, forWrite, &err);
     if (localPath.isEmpty())
@@ -159,6 +196,13 @@ int fuseUnlinkCb(const char *path) {
     return m->handleUnlink(path);
 }
 
+int fuseRenameCb(const char *oldPath, const char *newPath, unsigned int flags) {
+    FuseMount *m = currentMount();
+    if (!m)
+        return -EIO;
+    return m->handleRename(oldPath, newPath, flags);
+}
+
 int fuseUtimensCb(const char *path, const struct timespec tv[2], struct fuse_file_info *) {
     FuseMount *m = currentMount();
     if (!m || !m->backend())
@@ -172,8 +216,31 @@ int fuseUtimensCb(const char *path, const struct timespec tv[2], struct fuse_fil
     return 0;
 }
 
+int fuseStatfsCb(const char *, struct statvfs *stbuf) {
+    if (!stbuf)
+        return -EIO;
+    std::memset(stbuf, 0, sizeof(struct statvfs));
+    FuseMount *m = currentMount();
+    const QString target = (m && !m->mountPoint().isEmpty()) ? QFileInfo(m->mountPoint()).absolutePath() : QDir::homePath();
+    if (::statvfs(target.toUtf8().constData(), stbuf) != 0)
+        return -errno;
+    return 0;
+}
+
+void *fuseInitCb(struct fuse_conn_info *, struct fuse_config *cfg) {
+    if (cfg) {
+        cfg->entry_timeout = 10.0;
+        cfg->attr_timeout = 10.0;
+        cfg->negative_timeout = 5.0;
+        cfg->auto_cache = 1;
+    }
+    struct fuse_context *ctx = fuse_get_context();
+    return ctx ? ctx->private_data : nullptr;
+}
+
 struct fuse_operations buildOperations() {
     struct fuse_operations ops {};
+    ops.init = fuseInitCb;
     ops.getattr = fuseGetattrCb;
     ops.readdir = fuseReaddirCb;
     ops.open = fuseOpenCb;
@@ -183,7 +250,9 @@ struct fuse_operations buildOperations() {
     ops.truncate = fuseTruncateCb;
     ops.release = fuseReleaseCb;
     ops.unlink = fuseUnlinkCb;
+    ops.rename = fuseRenameCb;
     ops.utimens = fuseUtimensCb;
+    ops.statfs = fuseStatfsCb;
     return ops;
 }
 
@@ -242,8 +311,10 @@ QStringList FuseMount::handleReaddir(const char *path, int *errOut) {
         return {};
     }
     const QString rel = normalizeRelPath(path);
+    struct fuse_context *ctx = fuse_get_context();
+    const bool allowRemoteSync = !(ctx && isBackgroundIndexerOrThumbnailer(ctx->pid));
     bool exists = false;
-    const QStringList list = m_backend->vfsReadDir(rel, &exists);
+    const QStringList list = m_backend->vfsReadDir(rel, &exists, allowRemoteSync);
     if (!exists && errOut)
         *errOut = -ENOENT;
     return list;
@@ -298,6 +369,28 @@ int FuseMount::handleUnlink(const char *path) {
     return m_backend->vfsUnlinkFile(rel) ? 0 : -ENOENT;
 }
 
+int FuseMount::handleRename(const char *oldPath, const char *newPath, unsigned int flags) {
+    if (!m_backend)
+        return -EIO;
+    return m_backend->vfsRename(normalizeRelPath(oldPath), normalizeRelPath(newPath), flags);
+}
+
+bool FuseMount::isExternalFuseMounted(const QString &mountPoint) {
+    QFile mounts(QStringLiteral("/proc/self/mounts"));
+    if (!mounts.open(QIODevice::ReadOnly))
+        return false;
+    const QByteArray cleanTarget = QDir::cleanPath(QFileInfo(mountPoint).absoluteFilePath()).toUtf8();
+    const QList<QByteArray> lines = mounts.readAll().split('\n');
+    for (const QByteArray &line : lines) {
+        const QList<QByteArray> cols = line.split(' ');
+        if (cols.size() >= 3 && cols.at(1) == cleanTarget && (cols.at(2).contains("fuse.wickfs") || cols.at(2).contains("fuse.gdrive"))) {
+            struct stat st {};
+            return ::stat(cleanTarget.constData(), &st) == 0;
+        }
+    }
+    return false;
+}
+
 bool FuseMount::mount(const QString &mountPoint, QString *errorOut) {
     std::lock_guard<std::mutex> lock(m_lifecycleMutex);
     if (m_mounted.load())
@@ -305,6 +398,22 @@ bool FuseMount::mount(const QString &mountPoint, QString *errorOut) {
 
     QDir().mkpath(mountPoint);
     m_mountPoint = mountPoint;
+
+    const bool fuseAllowed = (qEnvironmentVariable("QT_QPA_PLATFORM") != QLatin1String("offscreen")
+                              || !qEnvironmentVariableIsEmpty("WICKFS_ENABLE_FUSE"))
+                             && qEnvironmentVariableIsEmpty("WICKFS_DISABLE_FUSE");
+
+    // If wickfs daemon already holds an active kernel FUSE mount at ~/Drive,
+    // attach cleanly instead of yanking it out from under open file managers.
+    // The daemon itself sets WICKFS_OWNER_FUSE so it always cleans stale mounts and owns FUSE.
+    if (fuseAllowed && qEnvironmentVariableIsEmpty("WICKFS_OWNER_FUSE") && isExternalFuseMounted(mountPoint)) {
+        m_mounted.store(true);
+        m_kernelFuse.store(true);
+        m_ownsFuse.store(false);
+        m_lastError.clear();
+        emit stateChanged();
+        return true;
+    }
 
     const bool hasDevFuse = QFileInfo::exists("/dev/fuse");
     const QString fusermountBin = QStandardPaths::findExecutable("fusermount3");
@@ -318,20 +427,24 @@ bool FuseMount::mount(const QString &mountPoint, QString *errorOut) {
         cleanup.waitForFinished(1500);
 
         // Only attempt kernel FUSE mount when not running offscreen in a test harness.
-        if (qEnvironmentVariable("QT_QPA_PLATFORM") != QLatin1String("offscreen")) {
-            char arg0[] = "gdrive";
+        if (fuseAllowed) {
+            char arg0[] = "wickfs";
             char arg1[] = "-o";
-            char arg2[] = "fsname=gdrive,subtype=gdrive,default_permissions";
+            char arg2[] = "fsname=wickfs,subtype=wickfs,default_permissions";
             char *argv[] = {arg0, arg1, arg2, nullptr};
             struct fuse_args args = FUSE_ARGS_INIT(3, argv);
 
             m_fuse = fuse_new(&args, &s_ops, sizeof(s_ops), this);
             fuse_opt_free_args(&args);
 
-            if (m_fuse) {
-                if (fuse_mount(m_fuse, mountPoint.toUtf8().constData()) == 0) {
+            if (!m_fuse) {
+                qWarning("wickfs: fuse_new failed for %s", mountPoint.toUtf8().constData());
+            } else {
+                const int rc = fuse_mount(m_fuse, mountPoint.toUtf8().constData());
+                if (rc == 0) {
                     m_mounted.store(true);
                     m_kernelFuse.store(true);
+                    m_ownsFuse.store(true);
                     m_lastError.clear();
                     m_thread = std::thread([this]() {
                         fuse_loop(m_fuse);
@@ -339,6 +452,7 @@ bool FuseMount::mount(const QString &mountPoint, QString *errorOut) {
                     emit stateChanged();
                     return true;
                 }
+                qWarning("wickfs: fuse_mount(%s) failed with rc=%d errno=%d", mountPoint.toUtf8().constData(), rc, errno);
                 fuse_destroy(m_fuse);
                 m_fuse = nullptr;
             }
@@ -351,6 +465,7 @@ bool FuseMount::mount(const QString &mountPoint, QString *errorOut) {
     if (QDir(mountPoint).exists()) {
         m_mounted.store(true);
         m_kernelFuse.store(false);
+        m_ownsFuse.store(false);
         m_lastError.clear();
         emit stateChanged();
         return true;
@@ -368,7 +483,7 @@ void FuseMount::unmount() {
     if (!m_mounted.load())
         return;
 
-    if (m_kernelFuse.load() && m_fuse) {
+    if (m_ownsFuse.load() && m_kernelFuse.load() && m_fuse) {
         fuse_exit(m_fuse);
         const QString fusermountBin = QStandardPaths::findExecutable("fusermount3");
         if (!fusermountBin.isEmpty() && !m_mountPoint.isEmpty())
@@ -384,5 +499,6 @@ void FuseMount::unmount() {
 
     m_mounted.store(false);
     m_kernelFuse.store(false);
+    m_ownsFuse.store(false);
     emit stateChanged();
 }

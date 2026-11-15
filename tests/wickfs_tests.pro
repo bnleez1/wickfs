@@ -1,7 +1,7 @@
 QT += core gui qml quick quickcontrols2 testlib dbus network
 CONFIG += c++17 testcase link_pkgconfig
 PKGCONFIG += fuse3
-TARGET = gdrive_tests
+TARGET = wickfs_tests
 TEMPLATE = app
 
 INCLUDEPATH += ../src
@@ -15,7 +15,7 @@ HEADERS += \
     ../src/translator.h
 
 SOURCES += \
-    gdrive_tests.cpp \
+    wickfs_tests.cpp \
     ../src/backend.cpp \
     ../src/fusemount.cpp \
     ../src/portalfilepicker.cpp \

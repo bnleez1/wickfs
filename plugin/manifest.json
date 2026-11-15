@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
-  "id": "ben.gdrive",
-  "name": "GDrive Sync",
+  "id": "ben.wickfs",
+  "name": "WickFS Sync",
   "version": "0.1.0",
   "author": "ben",
   "license": "MIT",
@@ -13,7 +13,7 @@
     "barWidget": "Panel.qml"
   },
   "barWidget": {
-    "displayName": "GDrive Sync",
+    "displayName": "WickFS Sync",
     "description": "Shows when Google Drive files are syncing or in sync, with smart LFU/LRU cache usage and quick controls.",
     "category": "Storage",
     "defaultSection": "right",

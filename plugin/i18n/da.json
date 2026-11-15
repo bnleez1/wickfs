@@ -1,7 +1,7 @@
 {
   "bar.syncing": "Synkroniserer…",
-  "bar.synced": "Synkroniseret",
-  "panel.title": "GDrive Smart-cache",
+  "bar.synced": "WickFS",
+  "panel.title": "WickFS Smart-cache",
   "panel.status.syncing": "Synkroniserer filer…",
   "panel.status.synced": "Alle filer er synkroniseret",
   "panel.detail.syncing": "Synkroniserer %1 (%2%)",
