@@ -44,6 +44,7 @@ void printUsage() {
         "  gdrive evict [<path>|--cold] [--state-dir DIR] [--json]     Evict a file or all cold cached files\n"
         "  gdrive budget [--max-mb N] [--min-free-gb N] [--threshold N] [--json]\n"
         "  gdrive sync [--remote NAME] [--folder DIR] [--json]         Sync catalog & enforce cache budget\n"
+        "  gdrive auth [status|setup] [--client-id ID] [--client-secret S] [--import-json FILE] [--json]\n"
         "  gdrive daemon [--once] [--json]                             Run background sync & standby-wake daemon\n"
         "  gdrive autostart [enable|status] [--json]                   Configure auto-start on boot & wake from standby\n"
         "  gdrive plugin install [--json]                              Install the Omarchy top-bar sync widget (ben.gdrive)\n"
@@ -197,7 +198,8 @@ QString extractPositional(const QStringList &args) {
     for (int i = 2; i < args.size(); ++i) {
         const QString a = args.at(i);
         if (a == "--state-dir" || a == "--filter" || a == "--max-mb"
-            || a == "--min-free-gb" || a == "--threshold" || a == "--remote" || a == "--folder") {
+            || a == "--min-free-gb" || a == "--threshold" || a == "--remote" || a == "--folder"
+            || a == "--client-id" || a == "--client-secret" || a == "--import-json") {
             ++i;
             continue;
         }
@@ -215,7 +217,7 @@ bool isCliInvocation(const QStringList &args) {
     const QString cmd = args.at(1);
     return cmd == "check" || cmd == "status" || cmd == "ls" || cmd == "access"
         || cmd == "pin" || cmd == "unpin" || cmd == "evict" || cmd == "budget"
-        || cmd == "sync" || cmd == "daemon" || cmd == "autostart"
+        || cmd == "sync" || cmd == "auth" || cmd == "daemon" || cmd == "autostart"
         || cmd == "plugin" || cmd == "skill"
         || cmd == "--help" || cmd == "-h" || cmd == "--version" || cmd == "-v";
 }
@@ -522,6 +524,51 @@ int runCli(int argc, char *argv[]) {
         } else {
             std::fprintf(stdout, "Synced %d files (%s cached)\n",
                          backend.totalFileCount(), backend.cachedFormatted().toUtf8().constData());
+        }
+        return 0;
+    }
+
+    if (cmd == "auth") {
+        const QString sub = extractPositional(args);
+        const QString remote = extractOption(args, "--remote").isEmpty()
+            ? QStringLiteral("gdrive")
+            : extractOption(args, "--remote");
+        const QString importJson = extractOption(args, "--import-json");
+        const QString clientId = extractOption(args, "--client-id");
+        const QString clientSecret = extractOption(args, "--client-secret");
+
+        if (sub == "setup" || !importJson.isEmpty() || !clientId.isEmpty() || args.contains("--builtin")) {
+            if (!importJson.isEmpty()) {
+                QString err;
+                if (!backend.importGoogleClientSecretJson(importJson, remote, &err)) {
+                    printErr(err, json);
+                    return 1;
+                }
+            } else {
+                if (!backend.configureOAuthClient(remote, clientId, clientSecret)) {
+                    printErr(backend.statusBannerText(), json);
+                    return 1;
+                }
+            }
+        }
+
+        if (json) {
+            printOut({
+                {"ok", true},
+                {"remoteName", backend.remoteName()},
+                {"sourceMode", backend.sourceMode()},
+                {"rcloneConfigPath", backend.rcloneConfigPath()},
+                {"oauthAuthorized", backend.oauthAuthorized()},
+                {"oauthClientMode", backend.oauthClientModeLabel()},
+                {"oauthClientIdConfigured", !backend.oauthClientId().isEmpty()},
+                {"oauthStatusSummary", backend.oauthStatusSummary()}
+            });
+        } else {
+            std::fprintf(stdout, "Google Drive Remote:  %s:\n", backend.remoteName().toUtf8().constData());
+            std::fprintf(stdout, "OAuth Token Active:   %s\n", backend.oauthAuthorized() ? "yes" : "no");
+            std::fprintf(stdout, "OAuth Client Mode:    %s\n", backend.oauthClientModeLabel().toUtf8().constData());
+            std::fprintf(stdout, "Config File:          %s\n", backend.rcloneConfigPath().toUtf8().constData());
+            std::fprintf(stdout, "Summary:              %s\n", backend.oauthStatusSummary().toUtf8().constData());
         }
         return 0;
     }

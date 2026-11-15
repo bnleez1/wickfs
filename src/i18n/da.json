@@ -146,5 +146,16 @@
   "Complete Sync": "Afslut synk",
   "Simulate Syncing State": "Simuler synkronisering",
   "Sync Now (R)": "Synkroniser nu (R)",
-  "Checking remote catalog (%1%)": "Tjekker fjernkatalog (%1%)"
+  "Checking remote catalog (%1%)": "Tjekker fjernkatalog (%1%)",
+  "Custom Google OAuth Client ID": "Brugerdefineret Google OAuth Client ID",
+  "Built-in Google OAuth Client ID": "Indbygget Google OAuth Client ID",
+  "OAuth Token Active · Custom Client ID (%1)": "OAuth-token aktiv · Brugerdefineret Client ID (%1)",
+  "OAuth Token Active · Built-in Google Client ID ready": "OAuth-token aktiv · Indbygget Google Client ID klar",
+  "Custom Client ID saved — click Authorize Google OAuth to sign in": "Brugerdefineret Client ID gemt — klik Godkend Google OAuth for at logge ind",
+  "Using built-in Google OAuth Client ID (or enter custom GCP credentials)": "Bruger indbygget Google OAuth Client ID (eller angiv egne GCP-oplysninger)",
+  "Google OAuth Client ID (leave empty for built-in)": "Google OAuth Client ID (lad stå tom for indbygget)",
+  "Google OAuth Client Secret (optional)": "Google OAuth Client Secret (valgfri)",
+  "Import client_secret.json…": "Importer client_secret.json…",
+  "Save Client ID": "Gem Client ID",
+  "GCP Console": "GCP-konsol"
 }

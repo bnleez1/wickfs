@@ -343,6 +343,45 @@ private slots:
         QCOMPARE(b.syncState(), QString("synced"));
     }
 
+    void testOAuthClientIdAndJsonImport()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        Backend b(dir.path() + "/state", dir.path() + "/mnt");
+        const QString cfgPath = dir.path() + "/rclone.conf";
+
+        // Pre-seed a token in rclone.conf like an authorized remote
+        write(cfgPath,
+              "[gdrive]\n"
+              "type = drive\n"
+              "client_id = \n"
+              "client_secret = \n"
+              "token = {\"access_token\":\"test-tok\",\"refresh_token\":\"test-ref\"}\n");
+        b.setRcloneConfigPath(cfgPath);
+
+        QCOMPARE(b.oauthAuthorized(), true);
+        QCOMPARE(b.oauthClientId(), QString(""));
+        QCOMPARE(b.oauthClientModeLabel(), QString("Built-in Google OAuth Client ID"));
+
+        // Import a Google Cloud client_secret.json file while preserving the existing token
+        const QString jsonPath = dir.path() + "/client_secret.json";
+        write(jsonPath,
+              "{\"installed\":{\"client_id\":\"12345-test.apps.googleusercontent.com\","
+              "\"client_secret\":\"GOCSPX-secret123\"}}");
+
+        QString err;
+        QVERIFY2(b.importGoogleClientSecretJson(jsonPath, "gdrive", &err), qPrintable(err));
+        QCOMPARE(b.oauthAuthorized(), true);
+        QCOMPARE(b.oauthClientId(), QString("12345-test.apps.googleusercontent.com"));
+        QCOMPARE(b.oauthClientSecret(), QString("GOCSPX-secret123"));
+        QCOMPARE(b.oauthClientModeLabel(), QString("Custom Google OAuth Client ID"));
+
+        // Reset back to built-in Client ID while keeping the token intact
+        QVERIFY(b.configureOAuthClient("gdrive", "", ""));
+        QCOMPARE(b.oauthAuthorized(), true);
+        QCOMPARE(b.oauthClientId(), QString(""));
+    }
+
 private:
     static void write(const QString &path, const QByteArray &contents)
     {

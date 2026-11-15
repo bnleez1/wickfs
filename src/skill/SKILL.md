@@ -36,6 +36,11 @@ gdrive evict --cold --json
 # Configure maximum cache size (MB), free disk floor (GB), and frequent access threshold
 gdrive budget --max-mb 250 --min-free-gb 15 --threshold 3 --json
 
+# Configure Google OAuth Client ID / Secret or verify built-in OAuth token
+gdrive auth status --json
+gdrive auth setup --builtin --json
+gdrive auth setup --import-json ~/Downloads/client_secret.json --json
+
 # Install or update the Omarchy top-bar sync status widget plugin (ben.gdrive)
 gdrive plugin install --json
 

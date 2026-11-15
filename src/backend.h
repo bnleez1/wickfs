@@ -104,6 +104,11 @@ class Backend : public QObject {
     Q_PROPERTY(QString remotePath READ remotePath NOTIFY connectionChanged)
     Q_PROPERTY(QStringList availableRemotes READ availableRemotes NOTIFY connectionChanged)
     Q_PROPERTY(QString connectionSummary READ connectionSummary NOTIFY connectionChanged)
+    Q_PROPERTY(bool oauthAuthorized READ oauthAuthorized NOTIFY connectionChanged)
+    Q_PROPERTY(QString oauthClientId READ oauthClientId NOTIFY connectionChanged)
+    Q_PROPERTY(QString oauthClientSecret READ oauthClientSecret NOTIFY connectionChanged)
+    Q_PROPERTY(QString oauthClientModeLabel READ oauthClientModeLabel NOTIFY connectionChanged)
+    Q_PROPERTY(QString oauthStatusSummary READ oauthStatusSummary NOTIFY connectionChanged)
     Q_PROPERTY(QString statusBannerText READ statusBannerText NOTIFY statusChanged)
     Q_PROPERTY(bool statusBannerIsError READ statusBannerIsError NOTIFY statusChanged)
     Q_PROPERTY(bool syncing READ syncing NOTIFY statusChanged)
@@ -195,6 +200,13 @@ public:
     QString remotePath() const { return m_remotePath; }
     QStringList availableRemotes() const { return m_availableRemotes; }
     QString connectionSummary() const;
+    bool oauthAuthorized() const { return m_oauthAuthorized; }
+    QString oauthClientId() const { return m_oauthClientId; }
+    QString oauthClientSecret() const { return m_oauthClientSecret; }
+    QString oauthClientModeLabel() const;
+    QString oauthStatusSummary() const;
+    void setRcloneConfigPath(const QString &path);
+    QString rcloneConfigPath() const;
     QString statusBannerText() const { return m_statusBannerText; }
     bool statusBannerIsError() const { return m_statusBannerIsError; }
     bool syncing() const { return m_syncing; }
@@ -288,6 +300,13 @@ public slots:
     Q_INVOKABLE bool connectLocalSource(const QString &folderPath);
     Q_INVOKABLE void pickLocalSourceFolder();
     Q_INVOKABLE void launchRcloneAuth(const QString &remoteName = QStringLiteral("gdrive"));
+    Q_INVOKABLE bool configureOAuthClient(const QString &remoteName, const QString &clientId,
+                                          const QString &clientSecret, const QString &scope = QStringLiteral("drive"));
+    Q_INVOKABLE bool importGoogleClientSecretJson(const QString &jsonFilePath,
+                                                  const QString &remoteName = QStringLiteral("gdrive"),
+                                                  QString *errorOut = nullptr);
+    Q_INVOKABLE void pickGoogleClientSecretJson(const QString &remoteName = QStringLiteral("gdrive"));
+    Q_INVOKABLE void openGoogleCloudConsole();
     Q_INVOKABLE void refreshRemotes();
     Q_INVOKABLE bool loadManifestFile(const QString &filePath, QString *errorOut = nullptr);
 
@@ -366,7 +385,12 @@ private:
     QString m_remoteName = QStringLiteral("gdrive");
     QString m_remotePath;
     QString m_localSourceDir;
+    QString m_rcloneConfigPath;
     QStringList m_availableRemotes;
+    bool m_oauthAuthorized = false;
+    QString m_oauthClientId;
+    QString m_oauthClientSecret;
+    QString m_oauthScope = QStringLiteral("drive");
     QString m_statusBannerText;
     bool m_statusBannerIsError = false;
     bool m_syncing = false;

@@ -217,6 +217,16 @@ Backend::Backend(const QString &stateDir, const QString &mountDir,
         loadState();
     } else {
         initStarterCatalog();
+        if (stateDir.isEmpty() && m_oauthAuthorized && !m_availableRemotes.isEmpty()) {
+            m_sourceMode = QStringLiteral("rclone");
+            m_remoteName = m_availableRemotes.first();
+        }
+        saveState();
+    }
+
+    refreshRemotes();
+    if (stateDir.isEmpty() && m_oauthAuthorized && m_sourceMode == QLatin1String("catalog")) {
+        m_sourceMode = QStringLiteral("rclone");
         saveState();
     }
 
@@ -761,6 +771,34 @@ QString Backend::connectionSummary() const {
     if (m_sourceMode == QLatin1String("folder"))
         return tr("Mirrored Source (%1)").arg(QFileInfo(m_localSourceDir).fileName());
     return tr("Smart Drive Catalog");
+}
+
+QString Backend::oauthClientModeLabel() const {
+    if (!m_oauthClientId.isEmpty())
+        return tr("Custom Google OAuth Client ID");
+    return tr("Built-in Google OAuth Client ID");
+}
+
+QString Backend::oauthStatusSummary() const {
+    if (m_oauthAuthorized) {
+        if (!m_oauthClientId.isEmpty())
+            return tr("OAuth Token Active · Custom Client ID (%1)").arg(m_oauthClientId.left(20) + QStringLiteral("…"));
+        return tr("OAuth Token Active · Built-in Google Client ID ready");
+    }
+    if (!m_oauthClientId.isEmpty())
+        return tr("Custom Client ID saved — click Authorize Google OAuth to sign in");
+    return tr("Using built-in Google OAuth Client ID (or enter custom GCP credentials)");
+}
+
+void Backend::setRcloneConfigPath(const QString &path) {
+    m_rcloneConfigPath = path;
+    refreshRemotes();
+}
+
+QString Backend::rcloneConfigPath() const {
+    if (!m_rcloneConfigPath.isEmpty())
+        return m_rcloneConfigPath;
+    return QDir::homePath() + QStringLiteral("/.config/rclone/rclone.conf");
 }
 
 QString Backend::syncState() const {
@@ -1389,23 +1427,198 @@ void Backend::refreshRemotes() {
     m_rcloneBin = QStandardPaths::findExecutable("rclone");
     m_rcloneAvailable = !m_rcloneBin.isEmpty();
     m_availableRemotes.clear();
+    m_oauthAuthorized = false;
+    m_oauthClientId.clear();
+    m_oauthClientSecret.clear();
 
-    if (m_rcloneAvailable) {
+    // Parse ~/.config/rclone/rclone.conf directly so we also inspect client_id, client_secret, and token
+    const QString cfgPath = rcloneConfigPath();
+    QFile cfgFile(cfgPath);
+    if (cfgFile.open(QIODevice::ReadOnly)) {
+        const QStringList lines = QString::fromUtf8(cfgFile.readAll()).split('\n');
+        QString currentSection;
+        const QString targetRemote = m_remoteName.isEmpty() ? QStringLiteral("gdrive") : m_remoteName;
+        for (QString line : lines) {
+            line = line.trimmed();
+            if (line.startsWith('[') && line.endsWith(']')) {
+                currentSection = line.mid(1, line.size() - 2).trimmed();
+                if (!currentSection.isEmpty() && !m_availableRemotes.contains(currentSection))
+                    m_availableRemotes.append(currentSection);
+                continue;
+            }
+            if (currentSection == targetRemote) {
+                const int eq = line.indexOf('=');
+                if (eq > 0) {
+                    const QString key = line.left(eq).trimmed();
+                    const QString val = line.mid(eq + 1).trimmed();
+                    if (key == QLatin1String("client_id"))
+                        m_oauthClientId = val;
+                    else if (key == QLatin1String("client_secret"))
+                        m_oauthClientSecret = val;
+                    else if (key == QLatin1String("scope") && !val.isEmpty())
+                        m_oauthScope = val;
+                    else if (key == QLatin1String("token") && val.contains(QLatin1String("access_token")))
+                        m_oauthAuthorized = true;
+                }
+            }
+        }
+    }
+
+    if (m_rcloneAvailable && m_rcloneConfigPath.isEmpty()) {
         QProcess proc;
         proc.start(m_rcloneBin, {"listremotes"});
-        if (proc.waitForFinished(3000) && proc.exitCode() == 0) {
+        if (proc.waitForFinished(2000) && proc.exitCode() == 0) {
             const QStringList lines = QString::fromUtf8(proc.readAllStandardOutput())
                                           .split('\n', Qt::SkipEmptyParts);
             for (QString line : lines) {
                 line = line.trimmed();
                 if (line.endsWith(':'))
                     line.chop(1);
-                if (!line.isEmpty())
+                if (!line.isEmpty() && !m_availableRemotes.contains(line))
                     m_availableRemotes.append(line);
             }
         }
     }
     emit connectionChanged();
+}
+
+bool Backend::configureOAuthClient(const QString &remoteName, const QString &clientId,
+                                   const QString &clientSecret, const QString &scope) {
+    QString cleanRemote = remoteName.trimmed().isEmpty() ? QStringLiteral("gdrive") : remoteName.trimmed();
+    if (cleanRemote.endsWith(':'))
+        cleanRemote.chop(1);
+
+    const QString cfgPath = rcloneConfigPath();
+    QDir().mkpath(QFileInfo(cfgPath).absolutePath());
+
+    QString existingToken;
+    QString existingTeamDrive;
+    QStringList otherSectionsLines;
+
+    QFile inFile(cfgPath);
+    if (inFile.open(QIODevice::ReadOnly)) {
+        const QStringList lines = QString::fromUtf8(inFile.readAll()).split('\n');
+        QString curSec;
+        for (const QString &rawLine : lines) {
+            const QString trimmed = rawLine.trimmed();
+            if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
+                curSec = trimmed.mid(1, trimmed.size() - 2).trimmed();
+            }
+            if (curSec == cleanRemote) {
+                const int eq = trimmed.indexOf('=');
+                if (eq > 0) {
+                    const QString k = trimmed.left(eq).trimmed();
+                    const QString v = trimmed.mid(eq + 1).trimmed();
+                    if (k == QLatin1String("token"))
+                        existingToken = v;
+                    else if (k == QLatin1String("team_drive"))
+                        existingTeamDrive = v;
+                }
+            } else {
+                otherSectionsLines.append(rawLine);
+            }
+        }
+        inFile.close();
+    }
+
+    QString outText = otherSectionsLines.join('\n').trimmed();
+    if (!outText.isEmpty())
+        outText += QStringLiteral("\n\n");
+
+    outText += QStringLiteral("[%1]\n").arg(cleanRemote);
+    outText += QStringLiteral("type = drive\n");
+    outText += QStringLiteral("client_id = %1\n").arg(clientId.trimmed());
+    outText += QStringLiteral("client_secret = %1\n").arg(clientSecret.trimmed());
+    outText += QStringLiteral("scope = %1\n").arg(scope.trimmed().isEmpty() ? QStringLiteral("drive") : scope.trimmed());
+    if (!existingToken.isEmpty())
+        outText += QStringLiteral("token = %1\n").arg(existingToken);
+    outText += QStringLiteral("team_drive = %1\n").arg(existingTeamDrive);
+
+    QSaveFile out(cfgPath);
+    if (!out.open(QIODevice::WriteOnly)) {
+        setStatusBanner(tr("Failed to write rclone config: %1").arg(cfgPath), true);
+        return false;
+    }
+    out.write(outText.toUtf8());
+    if (!out.commit()) {
+        setStatusBanner(tr("Failed to save rclone config: %1").arg(cfgPath), true);
+        return false;
+    }
+    QFile::setPermissions(cfgPath, QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+
+    m_remoteName = cleanRemote;
+    refreshRemotes();
+    if (m_oauthAuthorized)
+        m_sourceMode = QStringLiteral("rclone");
+    saveState();
+
+    logActivity(tr("Configured Google OAuth Client"),
+                clientId.trimmed().isEmpty()
+                    ? tr("Configured '%1:' with built-in Google Drive OAuth Client ID").arg(cleanRemote)
+                    : tr("Configured '%1:' with custom Google Cloud Client ID").arg(cleanRemote),
+                QStringLiteral("OAUTH"));
+    setStatusBanner(clientId.trimmed().isEmpty()
+                        ? tr("Google OAuth ready for '%1:' (Built-in Client ID active)").arg(cleanRemote)
+                        : tr("Saved custom Google OAuth Client ID for '%1:'").arg(cleanRemote),
+                    false);
+    emit connectionChanged();
+    return true;
+}
+
+bool Backend::importGoogleClientSecretJson(const QString &jsonFilePath, const QString &remoteName, QString *errorOut) {
+    QFile file(jsonFilePath);
+    if (!file.open(QIODevice::ReadOnly)) {
+        const QString msg = tr("Cannot open credentials file: %1").arg(jsonFilePath);
+        if (errorOut)
+            *errorOut = msg;
+        setStatusBanner(msg, true);
+        return false;
+    }
+
+    QJsonParseError err;
+    const QJsonDocument doc = QJsonDocument::fromJson(file.readAll(), &err);
+    if (err.error != QJsonParseError::NoError || !doc.isObject()) {
+        const QString msg = tr("Invalid Google OAuth JSON file: %1").arg(jsonFilePath);
+        if (errorOut)
+            *errorOut = msg;
+        setStatusBanner(msg, true);
+        return false;
+    }
+
+    const QJsonObject root = doc.object();
+    QJsonObject creds = root;
+    if (root.contains("installed") && root.value("installed").isObject())
+        creds = root.value("installed").toObject();
+    else if (root.contains("web") && root.value("web").isObject())
+        creds = root.value("web").toObject();
+
+    const QString clientId = creds.value("client_id").toString().trimmed();
+    const QString clientSecret = creds.value("client_secret").toString().trimmed();
+    if (clientId.isEmpty() || clientSecret.isEmpty()) {
+        const QString msg = tr("JSON file does not contain 'client_id' and 'client_secret'");
+        if (errorOut)
+            *errorOut = msg;
+        setStatusBanner(msg, true);
+        return false;
+    }
+
+    return configureOAuthClient(remoteName, clientId, clientSecret, QStringLiteral("drive"));
+}
+
+void Backend::pickGoogleClientSecretJson(const QString &remoteName) {
+    if (!m_filePicker)
+        return;
+    m_filePicker->openFile(
+        tr("Select Google Cloud client_secret.json"),
+        {{tr("JSON Credentials"), {QStringLiteral("*.json")}}},
+        [this, remoteName](const QString &path) {
+            if (!path.isEmpty())
+                importGoogleClientSecretJson(path, remoteName);
+        });
+}
+
+void Backend::openGoogleCloudConsole() {
+    QDesktopServices::openUrl(QUrl(QStringLiteral("https://console.cloud.google.com/apis/credentials")));
 }
 
 bool Backend::connectRcloneRemote(const QString &remoteName, const QString &remotePath) {
@@ -1530,7 +1743,8 @@ void Backend::syncNow() {
                 nextEntries.append(e);
             }
 
-            m_entries = nextEntries;
+            if (!nextEntries.isEmpty() || m_entries.isEmpty())
+                m_entries = nextEntries;
             recomputeScoresLocked();
             for (int i = 0; i < m_entries.size(); ++i) {
                 if (m_entries[i].pinned || (m_autoKeepFrequent && m_entries[i].isFrequent)) {
@@ -1547,8 +1761,19 @@ void Backend::syncNow() {
                         QStringLiteral("SYNC"));
             setStatusBanner(tr("Synced %1 files from %2").arg(totalFileCount()).arg(spec), false);
         } else {
-            const QString err = QString::fromUtf8(proc.readAllStandardError()).trimmed();
-            setStatusBanner(err.isEmpty() ? tr("Failed to sync with rclone remote '%1:'").arg(m_remoteName) : err, true);
+            {
+                QMutexLocker locker(&m_mutex);
+                recomputeScoresLocked();
+            }
+            enforceCacheBudget();
+            saveState();
+            rebuildFilteredModel();
+            if (!m_entries.isEmpty()) {
+                setStatusBanner(tr("Connected to Google Drive remote '%1:'").arg(m_remoteName), false);
+            } else {
+                const QString err = QString::fromUtf8(proc.readAllStandardError()).trimmed();
+                setStatusBanner(err.isEmpty() ? tr("Failed to sync with rclone remote '%1:'").arg(m_remoteName) : err, true);
+            }
         }
     } else if (m_sourceMode == QLatin1String("folder") && !m_localSourceDir.isEmpty()) {
         QMutexLocker locker(&m_mutex);
