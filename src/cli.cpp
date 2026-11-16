@@ -619,9 +619,9 @@ int runCli(int argc, char *argv[]) {
             return 0;
         }
 
-        // Periodic background sync every 5 minutes
+        // Periodic background sync every 15 minutes
         QTimer syncTimer;
-        syncTimer.setInterval(5 * 60 * 1000);
+        syncTimer.setInterval(15 * 60 * 1000);
         QObject::connect(&syncTimer, &QTimer::timeout, &backend, [&backend]() {
             if (!backend.mounted())
                 backend.mountDrive();

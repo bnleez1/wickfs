@@ -140,7 +140,9 @@ ApplicationWindow {
         context: Qt.ApplicationShortcut
         onActivated: {
             if (searchField.activeFocus) {
+                searchDebounce.stop()
                 searchField.text = ""
+                backend.searchQuery = ""
                 fileListView.forceActiveFocus()
             }
         }
@@ -832,13 +834,20 @@ ApplicationWindow {
                             Layout.fillWidth: true
                             spacing: 10
 
+                            Timer {
+                                id: searchDebounce
+                                interval: 120
+                                repeat: false
+                                onTriggered: backend.searchQuery = searchField.text
+                            }
+
                             TextField {
                                 id: searchField
                                 Layout.fillWidth: true
                                 placeholderText: qsTr("Search Drive files or folders (/ to focus)…")
                                 text: backend.searchQuery
                                 Material.roundedScale: theme.radius
-                                onTextEdited: backend.searchQuery = text
+                                onTextEdited: searchDebounce.restart()
                             }
 
                             Label {
@@ -856,6 +865,7 @@ ApplicationWindow {
                             Layout.fillWidth: true
                             Layout.fillHeight: true
                             clip: true
+                            cacheBuffer: 400
                             spacing: 6
                             model: backend.fileModel
                             currentIndex: backend.selectedIndex

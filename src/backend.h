@@ -19,6 +19,14 @@
 class FilePicker;
 class FuseMount;
 
+struct VfsDirEntry {
+    QString name;
+    qint64 sizeBytes = 0;
+    qint64 mtimeSecs = 0;
+    bool isDir = false;
+    bool isResident = false;
+};
+
 struct DriveFileEntry {
     QString path;            // Relative path inside Drive, e.g. "Engineering/System-Design.pdf"
     QString name;            // Base file name
@@ -323,10 +331,14 @@ public slots:
                  bool *isDirOut, bool *isResidentOut) const;
     Q_INVOKABLE bool vfsIsCloudOnly(const QString &relPath) const;
     QStringList vfsReadDir(const QString &relDirPath, bool *existsOut = nullptr, bool allowRemoteSync = true);
+    QList<VfsDirEntry> vfsReadDirEntries(const QString &relDirPath, bool *existsOut = nullptr,
+                                         bool allowRemoteSync = true);
     QString vfsOpenAndHydrate(const QString &relPath, bool forWrite, QString *errorOut = nullptr);
     bool vfsCreateFile(const QString &relPath, QString *localCachePathOut);
     bool vfsWriteCompleted(const QString &relPath);
     bool vfsUnlinkFile(const QString &relPath);
+    int vfsMkdir(const QString &relPath);
+    int vfsRmdir(const QString &relPath);
     int vfsRename(const QString &oldRelPath, const QString &newRelPath, unsigned int flags = 0);
 
     FuseMount *fuseMount() const { return m_fuseMount; }
@@ -355,7 +367,11 @@ private:
     void initStarterCatalog();
     void loadState();
     void saveState() const;
+    void scheduleSaveState(int delayMs = 400);
     void recomputeScoresLocked(qint64 nowSecs = 0);
+    void recomputeStatsLocked() const;
+    void ensureStatsFreshLocked() const;
+    void refreshStatvfsCacheLocked() const;
     void rebuildFilteredModel();
     bool hydrateEntryLocked(int idx, QString *errorOut = nullptr);
     void syncProjectionForEntryLocked(const DriveFileEntry &entry) const;
@@ -371,6 +387,7 @@ private:
     QByteArray synthesizePayloadForEntry(const DriveFileEntry &entry) const;
     void syncRemoteFolder(const QString &folder);
     void startAsyncRcloneSync(const QString &folderOnly = {});
+    void scheduleAsyncDirRefresh(const QString &relDirPath);
     void mergeRcloneRootJsonLocked(const QByteArray &rootJson);
     void mergeRcloneFolderJsonLocked(const QString &baseFolder, const QByteArray &folderJson,
                                      bool pruneDirectChildren = false);
@@ -380,6 +397,7 @@ private:
     QString m_stateDir;
     QString m_blobDir;
     QString m_mountDir;
+    bool m_isTestInstance = false;
     FilePicker *m_filePicker = nullptr;
     bool m_ownsPicker = false;
     FuseMount *m_fuseMount = nullptr;
@@ -405,6 +423,9 @@ private:
     QStringList m_availableRemotes;
     QStringList m_remoteFolders;
     QHash<QString, qint64> m_syncedDirTimestampsMs;
+    QSet<QString> m_listedDirs;
+    QSet<QString> m_dirRefreshInFlight;
+    QString m_pendingFolderSync;
     mutable QHash<QString, int> m_vfsFileIdx;
     mutable QHash<QString, QStringList> m_vfsDirChildren;
     mutable QSet<QString> m_vfsDirs;
@@ -412,6 +433,23 @@ private:
     mutable qint64 m_lastLoadedStateMtimeMs = 0;
     mutable qint64 m_lastLoadedStateSize = 0;
     QTimer m_stateWatchTimer;
+    QTimer m_saveDebounceTimer;
+
+    // Single-pass cached aggregate stats (protected by m_mutex)
+    mutable bool m_statsDirty = true;
+    mutable qint64 m_cachedTotalCloudBytes = 0;
+    mutable qint64 m_cachedCachedBytes = 0;
+    mutable qint64 m_cachedPinnedBytes = 0;
+    mutable qint64 m_cachedHotCachedBytes = 0;
+    mutable int m_cachedFrequentCount = 0;
+    mutable int m_cachedPinnedCount = 0;
+    mutable int m_cachedCachedCount = 0;
+    mutable int m_cachedCloudCount = 0;
+    mutable QStringList m_cachedFolders;
+    mutable qint64 m_lastStatvfsMs = 0;
+    mutable qint64 m_lastDiskAvailBytes = 100LL * 1024LL * 1024LL * 1024LL;
+    mutable qint64 m_lastDiskTotalBytes = 500LL * 1024LL * 1024LL * 1024LL;
+
     bool m_oauthAuthorized = false;
     QString m_oauthClientId;
     QString m_oauthClientSecret;

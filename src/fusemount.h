@@ -1,5 +1,8 @@
 #pragma once
 
+#include "backend.h"
+
+#include <QList>
 #include <QObject>
 #include <QString>
 #include <QStringList>
@@ -27,16 +30,21 @@ public:
 
     bool isMounted() const { return m_mounted.load(); }
     bool isKernelFuse() const { return m_kernelFuse.load(); }
+    bool ownsFuse() const { return m_ownsFuse.load(); }
     QString mountPoint() const { return m_mountPoint; }
     QString lastError() const { return m_lastError; }
     static bool isExternalFuseMounted(const QString &mountPoint);
+    void invalidatePath(const QString &relPath);
 
     // Direct VFS entry points used by both the libfuse3 callbacks and unit tests.
     int handleGetattr(const char *path, struct stat *stbuf);
     QStringList handleReaddir(const char *path, int *errOut = nullptr);
+    QList<VfsDirEntry> handleReaddirEntries(const char *path, int *errOut = nullptr);
     int handleOpenAndRead(const char *path, char *buf, size_t size, off_t offset);
     int handleWriteFile(const char *path, const char *buf, size_t size, off_t offset);
     int handleUnlink(const char *path);
+    int handleMkdir(const char *path, mode_t mode);
+    int handleRmdir(const char *path);
     int handleRename(const char *oldPath, const char *newPath, unsigned int flags = 0);
 
     Backend *backend() const { return m_backend; }
@@ -55,4 +63,5 @@ private:
     std::atomic<bool> m_kernelFuse{false};
     std::atomic<bool> m_ownsFuse{false};
     mutable std::mutex m_lifecycleMutex;
+    mutable std::mutex m_fusePtrMutex;
 };

@@ -203,6 +203,7 @@ Backend::Backend(const QString &stateDir, const QString &mountDir,
       m_stateDir(stateDir.isEmpty() ? QDir::homePath() + "/.local/share/wickfs" : stateDir),
       m_blobDir(m_stateDir + "/blobs"),
       m_mountDir(mountDir.isEmpty() ? QDir::homePath() + "/Drive" : mountDir),
+      m_isTestInstance(!stateDir.isEmpty()),
       m_filePicker(picker),
       m_ownsPicker(picker == nullptr) {
     if (!m_filePicker)
@@ -270,6 +271,12 @@ Backend::Backend(const QString &stateDir, const QString &mountDir,
         }
     });
 
+    m_saveDebounceTimer.setSingleShot(true);
+    m_saveDebounceTimer.setInterval(400);
+    connect(&m_saveDebounceTimer, &QTimer::timeout, this, [this]() {
+        saveState();
+    });
+
     refreshRemotes();
 
     if (QFileInfo::exists(m_stateDir + "/state.json")) {
@@ -283,7 +290,6 @@ Backend::Backend(const QString &stateDir, const QString &mountDir,
         saveState();
     }
 
-    refreshRemotes();
     if (stateDir.isEmpty() && m_oauthAuthorized && m_sourceMode == QLatin1String("catalog")) {
         m_sourceMode = QStringLiteral("rclone");
         saveState();
@@ -302,7 +308,10 @@ Backend::Backend(const QString &stateDir, const QString &mountDir,
     }
 
     if (m_sourceMode == QLatin1String("rclone")) {
-        setStatusBanner(tr("Connected to Google Drive remote '%1:'").arg(m_remoteName), false);
+        if (m_oauthClientId.isEmpty())
+            setStatusBanner(tr("Connected to Google Drive '%1:' (shared OAuth ID — press C to add client_secret.json for faster sync)").arg(m_remoteName), false);
+        else
+            setStatusBanner(tr("Connected to Google Drive remote '%1:'").arg(m_remoteName), false);
     } else if (!m_rcloneAvailable) {
         setStatusBanner(tr("rclone is not installed (run: omarchy-pkg-add rclone) — virtual drive active in local cache mode"), true);
     } else if (m_availableRemotes.isEmpty()) {
@@ -343,10 +352,17 @@ Backend::Backend(const QString &stateDir, const QString &mountDir,
 }
 
 Backend::~Backend() {
+    const bool wasProjectionMode = (m_fuseMount && m_fuseMount->isMounted() && !m_fuseMount->isKernelFuse());
+    if (m_saveDebounceTimer.isActive()) {
+        m_saveDebounceTimer.stop();
+        saveState();
+    }
     if (m_fuseMount && m_fuseMount->isMounted())
         m_fuseMount->unmount();
-    QMutexLocker locker(&m_mutex);
-    syncAllProjectionsLocked();
+    if (wasProjectionMode) {
+        QMutexLocker locker(&m_mutex);
+        syncAllProjectionsLocked();
+    }
 }
 
 QString Backend::formatSize(qint64 bytes) {
@@ -662,6 +678,10 @@ void Backend::syncProjectionForEntryLocked(const DriveFileEntry &entry) const {
     // When kernel FUSE is active, FUSE serves ~/Drive directly from m_blobDir and VFS metadata.
     if (m_fuseMount && m_fuseMount->isKernelFuse())
         return;
+    if (!m_isTestInstance && (!m_fuseMount || !m_fuseMount->isMounted()))
+        return;
+    if (FuseMount::isExternalFuseMounted(m_mountDir))
+        return;
 
     const QString targetPath = m_mountDir + "/" + entry.path;
     QDir().mkpath(QFileInfo(targetPath).absolutePath());
@@ -690,6 +710,10 @@ void Backend::syncAllProjectionsLocked() const {
         return;
     if (m_fuseMount && m_fuseMount->isKernelFuse())
         return;
+    if (!m_isTestInstance && (!m_fuseMount || !m_fuseMount->isMounted()))
+        return;
+    if (FuseMount::isExternalFuseMounted(m_mountDir))
+        return;
 
     for (const auto &entry : m_entries) {
         syncProjectionForEntryLocked(entry);
@@ -704,6 +728,78 @@ void Backend::recomputeScoresLocked(qint64 nowSecs) {
         if (entry.pinned)
             entry.state = QStringLiteral("pinned");
     }
+    m_statsDirty = true;
+}
+
+void Backend::recomputeStatsLocked() const {
+    qint64 totalCloud = 0;
+    qint64 cached = 0;
+    qint64 pinned = 0;
+    qint64 hotCached = 0;
+    int freqCount = 0;
+    int pinCount = 0;
+    int cacheCount = 0;
+    int cloudCount = 0;
+    QSet<QString> folderSet;
+
+    for (const QString &rf : m_remoteFolders) {
+        if (!rf.isEmpty() && rf != QLatin1String("/"))
+            folderSet.insert(rf);
+    }
+
+    for (const auto &e : m_entries) {
+        totalCloud += e.sizeBytes;
+        const bool isRes = (e.state == QLatin1String("pinned") || e.state == QLatin1String("cached"));
+        if (isRes) {
+            cached += e.sizeBytes;
+            ++cacheCount;
+        } else {
+            ++cloudCount;
+        }
+        if (e.pinned) {
+            pinned += e.sizeBytes;
+            ++pinCount;
+        } else if (e.state == QLatin1String("cached")) {
+            hotCached += e.sizeBytes;
+        }
+        if (e.isFrequent)
+            ++freqCount;
+        if (!e.folder.isEmpty() && e.folder != QLatin1String("/"))
+            folderSet.insert(e.folder);
+    }
+
+    QStringList foldersList = folderSet.values();
+    foldersList.sort(Qt::CaseInsensitive);
+
+    m_cachedTotalCloudBytes = totalCloud;
+    m_cachedCachedBytes = cached;
+    m_cachedPinnedBytes = pinned;
+    m_cachedHotCachedBytes = hotCached;
+    m_cachedFrequentCount = freqCount;
+    m_cachedPinnedCount = pinCount;
+    m_cachedCachedCount = cacheCount;
+    m_cachedCloudCount = cloudCount;
+    m_cachedFolders = foldersList;
+    m_statsDirty = false;
+}
+
+void Backend::ensureStatsFreshLocked() const {
+    if (m_statsDirty)
+        recomputeStatsLocked();
+}
+
+void Backend::refreshStatvfsCacheLocked() const {
+    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+    if (m_lastStatvfsMs > 0 && (nowMs - m_lastStatvfsMs) < 2000LL)
+        return;
+    struct statvfs vfs {};
+    if (::statvfs(m_stateDir.toUtf8().constData(), &vfs) == 0) {
+        if (vfs.f_bavail > 0)
+            m_lastDiskAvailBytes = static_cast<qint64>(vfs.f_bavail) * static_cast<qint64>(vfs.f_frsize);
+        if (vfs.f_blocks > 0)
+            m_lastDiskTotalBytes = static_cast<qint64>(vfs.f_blocks) * static_cast<qint64>(vfs.f_frsize);
+    }
+    m_lastStatvfsMs = nowMs;
 }
 
 void Backend::rebuildFilteredModel() {
@@ -844,18 +940,8 @@ void Backend::setSortMode(const QString &mode) {
 
 QStringList Backend::folders() const {
     QMutexLocker locker(&m_mutex);
-    QSet<QString> set;
-    for (const QString &rf : m_remoteFolders) {
-        if (!rf.isEmpty() && rf != QLatin1String("/"))
-            set.insert(rf);
-    }
-    for (const auto &e : m_entries) {
-        if (!e.folder.isEmpty() && e.folder != QLatin1String("/"))
-            set.insert(e.folder);
-    }
-    QStringList list = set.values();
-    list.sort(Qt::CaseInsensitive);
-    return list;
+    ensureStatsFreshLocked();
+    return m_cachedFolders;
 }
 
 bool Backend::mounted() const {
@@ -1004,60 +1090,46 @@ void Backend::finishSyncSimulation() {
 
 qint64 Backend::totalCloudBytes() const {
     QMutexLocker locker(&m_mutex);
-    qint64 sum = 0;
-    for (const auto &e : m_entries)
-        sum += e.sizeBytes;
-    return sum;
+    ensureStatsFreshLocked();
+    return m_cachedTotalCloudBytes;
 }
 
 qint64 Backend::cachedBytes() const {
     QMutexLocker locker(&m_mutex);
-    qint64 sum = 0;
-    for (const auto &e : m_entries) {
-        if (e.state == QLatin1String("pinned") || e.state == QLatin1String("cached"))
-            sum += e.sizeBytes;
-    }
-    return sum;
+    ensureStatsFreshLocked();
+    return m_cachedCachedBytes;
 }
 
 qint64 Backend::pinnedBytes() const {
     QMutexLocker locker(&m_mutex);
-    qint64 sum = 0;
-    for (const auto &e : m_entries) {
-        if (e.pinned)
-            sum += e.sizeBytes;
-    }
-    return sum;
+    ensureStatsFreshLocked();
+    return m_cachedPinnedBytes;
 }
 
 qint64 Backend::hotCachedBytes() const {
     QMutexLocker locker(&m_mutex);
-    qint64 sum = 0;
-    for (const auto &e : m_entries) {
-        if (!e.pinned && e.state == QLatin1String("cached"))
-            sum += e.sizeBytes;
-    }
-    return sum;
+    ensureStatsFreshLocked();
+    return m_cachedHotCachedBytes;
 }
 
 qint64 Backend::savedBytes() const {
-    return qMax<qint64>(0, totalCloudBytes() - cachedBytes());
+    QMutexLocker locker(&m_mutex);
+    ensureStatsFreshLocked();
+    return qMax<qint64>(0, m_cachedTotalCloudBytes - m_cachedCachedBytes);
 }
 
 qint64 Backend::diskAvailableBytes() const {
     if (m_simulatedDiskFreeBytes >= 0)
         return m_simulatedDiskFreeBytes;
-    struct statvfs vfs {};
-    if (::statvfs(m_stateDir.toUtf8().constData(), &vfs) == 0 && vfs.f_bavail > 0)
-        return static_cast<qint64>(vfs.f_bavail) * static_cast<qint64>(vfs.f_frsize);
-    return 100LL * 1024LL * 1024LL * 1024LL;
+    QMutexLocker locker(&m_mutex);
+    refreshStatvfsCacheLocked();
+    return m_lastDiskAvailBytes;
 }
 
 qint64 Backend::diskTotalBytes() const {
-    struct statvfs vfs {};
-    if (::statvfs(m_stateDir.toUtf8().constData(), &vfs) == 0 && vfs.f_blocks > 0)
-        return static_cast<qint64>(vfs.f_blocks) * static_cast<qint64>(vfs.f_frsize);
-    return 500LL * 1024LL * 1024LL * 1024LL;
+    QMutexLocker locker(&m_mutex);
+    refreshStatvfsCacheLocked();
+    return m_lastDiskTotalBytes;
 }
 
 qint64 Backend::effectiveBudgetBytes() const {
@@ -1191,38 +1263,26 @@ int Backend::totalFileCount() const {
 
 int Backend::frequentFileCount() const {
     QMutexLocker locker(&m_mutex);
-    int c = 0;
-    for (const auto &e : m_entries)
-        if (e.isFrequent)
-            ++c;
-    return c;
+    ensureStatsFreshLocked();
+    return m_cachedFrequentCount;
 }
 
 int Backend::pinnedFileCount() const {
     QMutexLocker locker(&m_mutex);
-    int c = 0;
-    for (const auto &e : m_entries)
-        if (e.pinned)
-            ++c;
-    return c;
+    ensureStatsFreshLocked();
+    return m_cachedPinnedCount;
 }
 
 int Backend::cachedFileCount() const {
     QMutexLocker locker(&m_mutex);
-    int c = 0;
-    for (const auto &e : m_entries)
-        if (e.state == QLatin1String("pinned") || e.state == QLatin1String("cached"))
-            ++c;
-    return c;
+    ensureStatsFreshLocked();
+    return m_cachedCachedCount;
 }
 
 int Backend::cloudOnlyFileCount() const {
     QMutexLocker locker(&m_mutex);
-    int c = 0;
-    for (const auto &e : m_entries)
-        if (e.state == QLatin1String("cloud"))
-            ++c;
-    return c;
+    ensureStatsFreshLocked();
+    return m_cachedCloudCount;
 }
 
 void Backend::primaryAction() {
@@ -1290,26 +1350,79 @@ void Backend::togglePinSelected() {
 
 bool Backend::setPinned(const QString &path, bool pinned) {
     pushUndoSnapshot(pinned ? tr("Pin %1").arg(path) : tr("Unpin %1").arg(path));
+
+    DriveFileEntry entryCopy;
+    QString sourceMode;
+    bool rcloneAvailable = false;
+    QString rcloneBin;
+    QString remoteName;
+    QString remotePath;
+    QString localSourceDir;
+    QString blobPath;
+
     {
         QMutexLocker locker(&m_mutex);
-        int idx = -1;
-        for (int i = 0; i < m_entries.size(); ++i) {
-            if (m_entries.at(i).path == path) {
-                idx = i;
-                break;
+        if (m_vfsFileIdx.isEmpty() && !m_entries.isEmpty())
+            rebuildVfsIndexLocked();
+        const int idx = m_vfsFileIdx.value(path, -1);
+        if (idx < 0 || idx >= m_entries.size())
+            return false;
+        entryCopy = m_entries.at(idx);
+        sourceMode = m_sourceMode;
+        rcloneAvailable = m_rcloneAvailable;
+        rcloneBin = m_rcloneBin;
+        remoteName = m_remoteName;
+        remotePath = m_remotePath;
+        localSourceDir = m_localSourceDir;
+        blobPath = localBlobPath(path);
+    }
+
+    if (pinned && !QFileInfo::exists(blobPath)) {
+        const auto fileLock = perPathHydrateMutex(path);
+        QMutexLocker fileLocker(fileLock.data());
+        if (!QFileInfo::exists(blobPath)) {
+            QDir().mkpath(QFileInfo(blobPath).absolutePath());
+            if (sourceMode == QLatin1String("rclone") && rcloneAvailable) {
+                fetchFromRclonePath(rcloneBin, remoteName, remotePath, path, blobPath, nullptr);
+            } else if (sourceMode == QLatin1String("folder") && !localSourceDir.isEmpty()) {
+                const QString srcFile = localSourceDir + QLatin1Char('/') + path;
+                if (QFileInfo::exists(srcFile)) {
+                    QFile::remove(blobPath);
+                    QFile::copy(srcFile, blobPath);
+                }
+            }
+            if (!QFileInfo::exists(blobPath) && sourceMode != QLatin1String("rclone")) {
+                QSaveFile f(blobPath);
+                if (f.open(QIODevice::WriteOnly)) {
+                    f.write(synthesizePayloadForEntry(entryCopy));
+                    f.commit();
+                }
             }
         }
-        if (idx < 0)
+    }
+
+    {
+        QMutexLocker locker(&m_mutex);
+        const int idx = m_vfsFileIdx.value(path, -1);
+        if (idx < 0 || idx >= m_entries.size())
             return false;
 
         m_entries[idx].pinned = pinned;
         if (pinned) {
-            hydrateEntryLocked(idx);
+            if (QFileInfo::exists(blobPath)) {
+                const qint64 diskSize = QFileInfo(blobPath).size();
+                if (m_sourceMode == QLatin1String("rclone") && diskSize > 0)
+                    m_entries[idx].sizeBytes = diskSize;
+                m_entries[idx].state = QStringLiteral("pinned");
+            } else {
+                m_entries[idx].state = QStringLiteral("pinned");
+            }
+            syncProjectionForEntryLocked(m_entries[idx]);
             logActivity(tr("Pinned Offline"),
                         tr("%1 (%2) locked on disk for offline use").arg(m_entries[idx].name, formatSize(m_entries[idx].sizeBytes)),
                         QStringLiteral("PIN"));
         } else {
-            m_entries[idx].state = QFileInfo::exists(localBlobPath(path))
+            m_entries[idx].state = QFileInfo::exists(blobPath)
                 ? QStringLiteral("cached")
                 : QStringLiteral("cloud");
             logActivity(tr("Unpinned"),
@@ -1319,6 +1432,8 @@ bool Backend::setPinned(const QString &path, bool pinned) {
         recomputeScoresLocked();
     }
 
+    if (m_fuseMount)
+        m_fuseMount->invalidatePath(path);
     enforceCacheBudget(pinned ? path : QString());
     saveState();
     rebuildFilteredModel();
@@ -1329,14 +1444,10 @@ bool Backend::evictFile(const QString &path, QString *errorOut) {
     pushUndoSnapshot(tr("Evict %1").arg(path));
     {
         QMutexLocker locker(&m_mutex);
-        int idx = -1;
-        for (int i = 0; i < m_entries.size(); ++i) {
-            if (m_entries.at(i).path == path) {
-                idx = i;
-                break;
-            }
-        }
-        if (idx < 0) {
+        if (m_vfsFileIdx.isEmpty() && !m_entries.isEmpty())
+            rebuildVfsIndexLocked();
+        const int idx = m_vfsFileIdx.value(path, -1);
+        if (idx < 0 || idx >= m_entries.size()) {
             if (errorOut)
                 *errorOut = tr("File not found: %1").arg(path);
             return false;
@@ -1354,12 +1465,15 @@ bool Backend::evictFile(const QString &path, QString *errorOut) {
             QFile::remove(blobPath);
 
         m_entries[idx].state = QStringLiteral("cloud");
+        m_statsDirty = true;
         syncProjectionForEntryLocked(m_entries[idx]);
         logActivity(tr("Evicted from Disk"),
                     tr("Freed %1 by returning %2 to Cloud Only").arg(formatSize(m_entries[idx].sizeBytes), m_entries[idx].name),
                     QStringLiteral("EVICT"));
     }
 
+    if (m_fuseMount)
+        m_fuseMount->invalidatePath(path);
     saveState();
     rebuildFilteredModel();
     return true;
@@ -1375,6 +1489,7 @@ int Backend::evictColdFiles(int maxFilesToEvict) {
     pushUndoSnapshot(tr("Evict cold files"));
     int evictedCount = 0;
     qint64 freedBytes = 0;
+    QStringList evictedPaths;
 
     {
         QMutexLocker locker(&m_mutex);
@@ -1414,10 +1529,17 @@ int Backend::evictColdFiles(int maxFilesToEvict) {
             if (QFileInfo::exists(blobPath))
                 QFile::remove(blobPath);
             m_entries[idx].state = QStringLiteral("cloud");
+            m_statsDirty = true;
             syncProjectionForEntryLocked(m_entries[idx]);
+            evictedPaths.append(m_entries[idx].path);
             freedBytes += m_entries[idx].sizeBytes;
             ++evictedCount;
         }
+    }
+
+    if (m_fuseMount) {
+        for (const QString &p : std::as_const(evictedPaths))
+            m_fuseMount->invalidatePath(p);
     }
 
     if (evictedCount > 0) {
@@ -1443,6 +1565,7 @@ int Backend::enforceCacheBudget(const QString &protectedPath) {
     int evictedCount = 0;
     qint64 freedBytes = 0;
     QStringList evictedNames;
+    QStringList evictedPaths;
 
     {
         QMutexLocker locker(&m_mutex);
@@ -1479,11 +1602,18 @@ int Backend::enforceCacheBudget(const QString &protectedPath) {
             if (QFileInfo::exists(blobPath))
                 QFile::remove(blobPath);
             m_entries[idx].state = QStringLiteral("cloud");
+            m_statsDirty = true;
             syncProjectionForEntryLocked(m_entries[idx]);
             freedBytes += m_entries[idx].sizeBytes;
             evictedNames.append(m_entries[idx].name);
+            evictedPaths.append(m_entries[idx].path);
             ++evictedCount;
         }
+    }
+
+    if (m_fuseMount) {
+        for (const QString &p : std::as_const(evictedPaths))
+            m_fuseMount->invalidatePath(p);
     }
 
     if (evictedCount > 0) {
@@ -1509,7 +1639,7 @@ bool Backend::mountDrive(QString *errorOut) {
     QString err;
     const bool ok = m_fuseMount->mount(m_mountDir, &err);
     if (ok) {
-        {
+        if (!m_fuseMount->isKernelFuse()) {
             QMutexLocker locker(&m_mutex);
             syncAllProjectionsLocked();
         }
@@ -1529,10 +1659,6 @@ void Backend::unmountDrive() {
     if (!m_fuseMount || !m_fuseMount->isMounted())
         return;
     m_fuseMount->unmount();
-    {
-        QMutexLocker locker(&m_mutex);
-        syncAllProjectionsLocked();
-    }
     logActivity(tr("Virtual Drive Unmounted"),
                 tr("Unmounted %1").arg(m_mountDir),
                 QStringLiteral("UNMOUNT"));
@@ -1580,7 +1706,7 @@ void Backend::refreshRemotes() {
         }
     }
 
-    if (m_rcloneAvailable && m_rcloneConfigPath.isEmpty()) {
+    if (m_rcloneAvailable && m_rcloneConfigPath.isEmpty() && m_availableRemotes.isEmpty()) {
         QProcess proc;
         proc.start(m_rcloneBin, {"listremotes"});
         if (proc.waitForFinished(2000) && proc.exitCode() == 0) {
@@ -1815,8 +1941,15 @@ namespace {
 
 bool runRcloneLsjson(const QString &rcloneBin, const QString &spec, int maxDepth, bool filesOnly,
                      int timeoutMs, QByteArray *stdoutOut, QString *errOut,
-                     const QString &configPath = {}) {
-    QStringList args = {"lsjson", "--max-depth", QString::number(maxDepth)};
+                     const QString &configPath = {}, bool recursive = false, bool fastList = false) {
+    QStringList args = {"lsjson", "--no-mimetype"};
+    if (recursive) {
+        args << "-R";
+        if (fastList)
+            args << "--fast-list";
+    } else {
+        args << "--max-depth" << QString::number(maxDepth);
+    }
     if (filesOnly)
         args << "--files-only";
     if (!configPath.isEmpty())
@@ -1844,13 +1977,17 @@ bool runRcloneLsjson(const QString &rcloneBin, const QString &spec, int maxDepth
     return true;
 }
 
-bool runRcloneMoveto(const QString &rcloneBin, const QString &srcSpec, const QString &dstSpec,
-                     int timeoutMs, QString *errOut, const QString &configPath = {}) {
-    QStringList args = {"moveto"};
+bool runRcloneCommand(const QString &rcloneBin, const QString &subcommand,
+                      const QStringList &cmdArgs, int timeoutMs,
+                      const QString &timeoutVerb, QString *errOut,
+                      const QString &configPath = {}) {
+    QStringList args = {subcommand};
     if (!configPath.isEmpty())
-        args << "--config" << configPath;
-    args << "--contimeout=5s" << QStringLiteral("--timeout=%1s").arg(qMax(1, timeoutMs / 1000))
-         << "--retries=1" << srcSpec << dstSpec;
+        args << QStringLiteral("--config") << configPath;
+    args << QStringLiteral("--contimeout=5s")
+         << QStringLiteral("--timeout=%1s").arg(qMax(1, timeoutMs / 1000))
+         << QStringLiteral("--retries=1");
+    args << cmdArgs;
 
     QProcess proc;
     proc.setStandardInputFile(QProcess::nullDevice());
@@ -1859,7 +1996,7 @@ bool runRcloneMoveto(const QString &rcloneBin, const QString &srcSpec, const QSt
         proc.kill();
         proc.waitForFinished(500);
         if (errOut)
-            *errOut = QStringLiteral("Timed out renaming %1").arg(srcSpec);
+            *errOut = QStringLiteral("Timed out %1").arg(timeoutVerb);
         return false;
     }
     if (proc.exitCode() != 0) {
@@ -1870,11 +2007,58 @@ bool runRcloneMoveto(const QString &rcloneBin, const QString &srcSpec, const QSt
     return true;
 }
 
+bool runRcloneMoveto(const QString &rcloneBin, const QString &srcSpec, const QString &dstSpec,
+                     int timeoutMs, QString *errOut, const QString &configPath = {}) {
+    return runRcloneCommand(rcloneBin, QStringLiteral("moveto"), {srcSpec, dstSpec},
+                            timeoutMs, QStringLiteral("renaming %1").arg(srcSpec), errOut, configPath);
+}
+
+bool runRcloneMkdir(const QString &rcloneBin, const QString &spec,
+                    int timeoutMs, QString *errOut, const QString &configPath = {}) {
+    return runRcloneCommand(rcloneBin, QStringLiteral("mkdir"), {spec},
+                            timeoutMs, QStringLiteral("creating directory %1").arg(spec), errOut, configPath);
+}
+
+bool runRcloneRmdir(const QString &rcloneBin, const QString &spec,
+                    int timeoutMs, QString *errOut, const QString &configPath = {}) {
+    return runRcloneCommand(rcloneBin, QStringLiteral("rmdir"), {spec},
+                            timeoutMs, QStringLiteral("removing directory %1").arg(spec), errOut, configPath);
+}
+
+template <typename Fn>
+bool runOnQtThread(const QObject *owner, Fn &&fn) {
+    if (!owner || QThread::currentThread() == owner->thread())
+        return fn();
+    bool ok = false;
+    std::unique_ptr<QThread> worker(QThread::create([&]() {
+        ok = fn();
+    }));
+    worker->start();
+    worker->wait();
+    return ok;
+}
+
+bool isRcloneNotFoundError(const QString &err) {
+    const QString lower = err.toLower();
+    return lower.contains(QLatin1String("not found"))
+        || lower.contains(QLatin1String("no such file"))
+        || lower.contains(QLatin1String("doesn't exist"))
+        || lower.contains(QLatin1String("does not exist"));
+}
+
 bool shouldUseAsyncRcloneSync() {
     return (qEnvironmentVariable("QT_QPA_PLATFORM") != QLatin1String("offscreen")
             || !qEnvironmentVariableIsEmpty("WICKFS_ENABLE_FUSE"))
         && qEnvironmentVariableIsEmpty("WICKFS_SYNC_BLOCKING")
         && QCoreApplication::instance() != nullptr;
+}
+
+QString cleanRelPath(QString p) {
+    while (p.startsWith('/'))
+        p.remove(0, 1);
+    while (p.endsWith('/'))
+        p.chop(1);
+    return p;
 }
 
 } // namespace
@@ -1897,7 +2081,9 @@ void Backend::mergeRcloneRootJsonLocked(const QByteArray &rootJson) {
     const bool kernelFuse = m_fuseMount && m_fuseMount->isKernelFuse();
     for (const QString &demoPath : kStarterDemoPaths) {
         QFile::remove(localBlobPath(demoPath));
-        if (!m_mountDir.isEmpty() && !kernelFuse)
+        if (!m_mountDir.isEmpty() && !kernelFuse && !m_isTestInstance)
+            QFile::remove(m_mountDir + "/" + demoPath);
+        else if (!m_mountDir.isEmpty() && !kernelFuse && m_isTestInstance)
             QFile::remove(m_mountDir + "/" + demoPath);
     }
 
@@ -1913,7 +2099,7 @@ void Backend::mergeRcloneRootJsonLocked(const QByteArray &rootJson) {
     QSet<QString> seenPaths;
     for (const auto &val : arr) {
         const QJsonObject obj = val.toObject();
-        const QString relPath = obj.value("Path").toString();
+        const QString relPath = cleanRelPath(obj.value("Path").toString());
         if (relPath.isEmpty())
             continue;
         if (obj.value("IsDir").toBool()) {
@@ -1953,17 +2139,15 @@ void Backend::mergeRcloneRootJsonLocked(const QByteArray &rootJson) {
 
     m_remoteFolders = nextFolders;
     m_entries = nextEntries;
+    m_listedDirs.insert(QString());
+    m_syncedDirTimestampsMs.insert(QString(), QDateTime::currentMSecsSinceEpoch());
     recomputeScoresLocked();
     rebuildVfsIndexLocked();
 }
 
 void Backend::mergeRcloneFolderJsonLocked(const QString &baseFolder, const QByteArray &folderJson,
                                           bool pruneDirectChildren) {
-    QString cleanBase = baseFolder;
-    while (cleanBase.startsWith('/'))
-        cleanBase.remove(0, 1);
-    while (cleanBase.endsWith('/'))
-        cleanBase.chop(1);
+    QString cleanBase = cleanRelPath(baseFolder);
     if (cleanBase == QLatin1String("Root"))
         cleanBase.clear();
 
@@ -1978,11 +2162,7 @@ void Backend::mergeRcloneFolderJsonLocked(const QString &baseFolder, const QByte
 
     for (const auto &val : arr) {
         const QJsonObject obj = val.toObject();
-        QString subRel = obj.value("Path").toString();
-        while (subRel.startsWith('/'))
-            subRel.remove(0, 1);
-        while (subRel.endsWith('/'))
-            subRel.chop(1);
+        const QString subRel = cleanRelPath(obj.value("Path").toString());
         if (subRel.isEmpty())
             continue;
 
@@ -2049,14 +2229,21 @@ void Backend::mergeRcloneFolderJsonLocked(const QString &baseFolder, const QByte
         }
     }
 
+    m_listedDirs.insert(cleanBase);
+    m_syncedDirTimestampsMs.insert(cleanBase, QDateTime::currentMSecsSinceEpoch());
     recomputeScoresLocked();
     rebuildVfsIndexLocked();
 }
 
 void Backend::startAsyncRcloneSync(const QString &folderOnly) {
     bool expected = false;
-    if (!m_rcloneSyncInFlight.compare_exchange_strong(expected, true))
+    if (!m_rcloneSyncInFlight.compare_exchange_strong(expected, true)) {
+        if (!folderOnly.isEmpty()) {
+            QMutexLocker locker(&m_mutex);
+            m_pendingFolderSync = folderOnly;
+        }
         return;
+    }
 
     QString rcloneBin;
     QString remoteName;
@@ -2080,9 +2267,9 @@ void Backend::startAsyncRcloneSync(const QString &folderOnly) {
         QByteArray rootJson;
         QString rootErr;
         bool rootOk = false;
+        const QString rootSpec = buildRcloneSpec(remoteName, remotePath);
         if (folderOnly.isEmpty()) {
-            const QString spec = buildRcloneSpec(remoteName, remotePath);
-            rootOk = runRcloneLsjson(rcloneBin, spec, 1, false, 15000, &rootJson, &rootErr, configPath);
+            rootOk = runRcloneLsjson(rcloneBin, rootSpec, 1, false, 60000, &rootJson, &rootErr, configPath, false, false);
         }
 
         QByteArray folderJson;
@@ -2091,20 +2278,25 @@ void Backend::startAsyncRcloneSync(const QString &folderOnly) {
         const QString targetFolder = folderOnly.isEmpty() ? activeFolder : folderOnly;
         if (!targetFolder.isEmpty() && targetFolder != QLatin1String("Root")) {
             const QString fSpec = buildRcloneSpec(remoteName, remotePath, targetFolder);
-            folderOk = runRcloneLsjson(rcloneBin, fSpec, 2, false, 12000, &folderJson, &folderErr, configPath);
+            folderOk = runRcloneLsjson(rcloneBin, fSpec, 2, false, 60000, &folderJson, &folderErr, configPath, false, false);
         }
 
         QMetaObject::invokeMethod(this, [this, folderOnly, rootOk, rootJson, rootErr, targetFolder, folderOk, folderJson]() {
             if (folderOnly.isEmpty() && rootOk) {
                 QMutexLocker locker(&m_mutex);
-                m_syncedDirTimestampsMs.clear();
                 mergeRcloneRootJsonLocked(rootJson);
             }
 
             if (folderOk && !targetFolder.isEmpty()) {
                 QMutexLocker locker(&m_mutex);
                 mergeRcloneFolderJsonLocked(targetFolder, folderJson, false);
-                m_syncedDirTimestampsMs.insert(targetFolder, QDateTime::currentMSecsSinceEpoch());
+            }
+
+            if (m_fuseMount) {
+                if (folderOnly.isEmpty())
+                    m_fuseMount->invalidatePath(QString());
+                if (!targetFolder.isEmpty() && targetFolder != QLatin1String("Root"))
+                    m_fuseMount->invalidatePath(targetFolder);
             }
 
             m_rcloneSyncInFlight.store(false);
@@ -2125,10 +2317,78 @@ void Backend::startAsyncRcloneSync(const QString &folderOnly) {
                                     false);
                 }
             }
+
+            QString queuedFolder;
+            {
+                QMutexLocker locker(&m_mutex);
+                queuedFolder = m_pendingFolderSync;
+                m_pendingFolderSync.clear();
+            }
+
             saveState();
             rebuildFilteredModel();
             emit statusChanged();
             emit statsChanged();
+
+            if (!queuedFolder.isEmpty())
+                startAsyncRcloneSync(queuedFolder);
+        }, Qt::QueuedConnection);
+    });
+    QObject::connect(t, &QThread::finished, t, &QObject::deleteLater);
+    t->start();
+}
+
+void Backend::scheduleAsyncDirRefresh(const QString &relDirPath) {
+    if (relDirPath.isEmpty() || !shouldUseAsyncRcloneSync())
+        return;
+
+    QString rcloneBin;
+    QString remoteName;
+    QString remotePath;
+    QString configPath;
+    {
+        QMutexLocker locker(&m_mutex);
+        if (m_sourceMode != QLatin1String("rclone") || !m_rcloneAvailable || !m_availableRemotes.contains(m_remoteName))
+            return;
+        if (m_dirRefreshInFlight.contains(relDirPath))
+            return;
+        m_dirRefreshInFlight.insert(relDirPath);
+        rcloneBin = m_rcloneBin;
+        remoteName = m_remoteName;
+        remotePath = m_remotePath;
+        configPath = m_rcloneConfigPath;
+    }
+
+    QThread *t = QThread::create([this, relDirPath, rcloneBin, remoteName, remotePath, configPath]() {
+        QByteArray dirJson;
+        QString dirErr;
+        const QString spec = buildRcloneSpec(remoteName, remotePath, relDirPath);
+        const bool synced = runRcloneLsjson(rcloneBin, spec, 1, false, 60000, &dirJson, &dirErr, configPath, false, false);
+        if (!synced) {
+            qWarning("wickfs: async readdir refresh failed for %s: %s",
+                     qPrintable(spec), qPrintable(dirErr));
+        }
+
+        QMetaObject::invokeMethod(this, [this, relDirPath, synced, dirJson]() {
+            constexpr qint64 kDirSyncTtlMs = 15LL * 60LL * 1000LL;
+            {
+                QMutexLocker locker(&m_mutex);
+                m_dirRefreshInFlight.remove(relDirPath);
+                const qint64 doneMs = QDateTime::currentMSecsSinceEpoch();
+                if (synced) {
+                    mergeRcloneFolderJsonLocked(relDirPath, dirJson, true);
+                } else {
+                    // Back off 30s before retrying failed background refresh
+                    m_syncedDirTimestampsMs.insert(relDirPath, doneMs - kDirSyncTtlMs + 30000LL);
+                }
+            }
+            if (synced) {
+                if (m_fuseMount)
+                    m_fuseMount->invalidatePath(relDirPath);
+                scheduleSaveState(500);
+                rebuildFilteredModel();
+                emit statsChanged();
+            }
         }, Qt::QueuedConnection);
     });
     QObject::connect(t, &QThread::finished, t, &QObject::deleteLater);
@@ -2180,7 +2440,6 @@ void Backend::syncNow() {
         if (finished) {
             {
                 QMutexLocker locker(&m_mutex);
-                m_syncedDirTimestampsMs.clear();
                 mergeRcloneRootJsonLocked(out);
             }
 
@@ -2504,6 +2763,7 @@ void Backend::rebuildVfsIndexLocked() const {
         list.sort(Qt::CaseInsensitive);
         m_vfsDirChildren.insert(it.key(), list);
     }
+    m_statsDirty = true;
 }
 
 bool Backend::vfsIsCloudOnly(const QString &relPath) const {
@@ -2552,14 +2812,15 @@ bool Backend::vfsStat(const QString &relPath, qint64 *sizeOut, qint64 *mtimeSecs
     return false;
 }
 
-QStringList Backend::vfsReadDir(const QString &relDirPath, bool *existsOut, bool allowRemoteSync) {
-    bool shouldSync = false;
+QList<VfsDirEntry> Backend::vfsReadDirEntries(const QString &relDirPath, bool *existsOut, bool allowRemoteSync) {
+    bool shouldSyncBlocking = false;
+    bool shouldRefreshAsync = false;
     QString rcloneBin;
     QString remoteName;
     QString remotePath;
     QString configPath;
 
-    constexpr qint64 kDirSyncTtlMs = 60LL * 1000LL;
+    constexpr qint64 kDirSyncTtlMs = 15LL * 60LL * 1000LL;
     const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
 
     {
@@ -2570,30 +2831,45 @@ QStringList Backend::vfsReadDir(const QString &relDirPath, bool *existsOut, bool
         if (allowRemoteSync && !relDirPath.isEmpty() && m_vfsDirs.contains(relDirPath)
             && m_sourceMode == QLatin1String("rclone") && m_rcloneAvailable
             && !m_remoteName.isEmpty() && m_availableRemotes.contains(m_remoteName)) {
+            const bool alreadyListed = m_listedDirs.contains(relDirPath);
             const qint64 lastSyncedMs = m_syncedDirTimestampsMs.value(relDirPath, 0);
-            if (nowMs - lastSyncedMs >= kDirSyncTtlMs) {
-                shouldSync = true;
+            const bool stale = (nowMs - lastSyncedMs >= kDirSyncTtlMs);
+
+            if (!alreadyListed) {
+                shouldSyncBlocking = true;
                 rcloneBin = m_rcloneBin;
                 remoteName = m_remoteName;
                 remotePath = m_remotePath;
                 configPath = m_rcloneConfigPath;
+            } else if (stale) {
+                shouldRefreshAsync = true;
             }
         }
     }
 
-    if (shouldSync) {
+    if (shouldRefreshAsync) {
+        if (shouldUseAsyncRcloneSync()) {
+            scheduleAsyncDirRefresh(relDirPath);
+        } else {
+            shouldSyncBlocking = true;
+        }
+    }
+
+    if (shouldSyncBlocking) {
         const auto dirLock = perPathHydrateMutex(QStringLiteral("dir:") + relDirPath);
         QMutexLocker dirLocker(dirLock.data());
 
-        bool stillStale = false;
+        bool stillNeedsSync = false;
         {
             QMutexLocker locker(&m_mutex);
             const qint64 checkNowMs = QDateTime::currentMSecsSinceEpoch();
-            stillStale = m_vfsDirs.contains(relDirPath)
+            const bool alreadyListed = m_listedDirs.contains(relDirPath);
+            const bool stale = (checkNowMs - m_syncedDirTimestampsMs.value(relDirPath, 0) >= kDirSyncTtlMs);
+            stillNeedsSync = m_vfsDirs.contains(relDirPath)
                 && m_sourceMode == QLatin1String("rclone") && m_rcloneAvailable
                 && !m_remoteName.isEmpty() && m_availableRemotes.contains(m_remoteName)
-                && (checkNowMs - m_syncedDirTimestampsMs.value(relDirPath, 0) >= kDirSyncTtlMs);
-            if (stillStale) {
+                && (!alreadyListed || (!shouldUseAsyncRcloneSync() && stale));
+            if (stillNeedsSync) {
                 rcloneBin = m_rcloneBin;
                 remoteName = m_remoteName;
                 remotePath = m_remotePath;
@@ -2601,17 +2877,17 @@ QStringList Backend::vfsReadDir(const QString &relDirPath, bool *existsOut, bool
             }
         }
 
-        if (stillStale) {
+        if (stillNeedsSync) {
             QByteArray dirJson;
             QString dirErr;
             const QString spec = buildRcloneSpec(remoteName, remotePath, relDirPath);
             bool synced = false;
             if (QThread::currentThread() == this->thread()) {
-                synced = runRcloneLsjson(rcloneBin, spec, 1, false, 25000, &dirJson, &dirErr, configPath);
+                synced = runRcloneLsjson(rcloneBin, spec, 1, false, 60000, &dirJson, &dirErr, configPath);
             } else {
                 // Run QProcess inside a QThread rather than a bare std::thread (FUSE loop).
                 std::unique_ptr<QThread> worker(QThread::create([&]() {
-                    synced = runRcloneLsjson(rcloneBin, spec, 1, false, 25000, &dirJson, &dirErr, configPath);
+                    synced = runRcloneLsjson(rcloneBin, spec, 1, false, 60000, &dirJson, &dirErr, configPath);
                 }));
                 worker->start();
                 worker->wait();
@@ -2625,14 +2901,19 @@ QStringList Backend::vfsReadDir(const QString &relDirPath, bool *existsOut, bool
                 QMutexLocker locker(&m_mutex);
                 const qint64 doneMs = QDateTime::currentMSecsSinceEpoch();
                 // On transient failure (e.g. offline), back off for 15s before retrying.
-                m_syncedDirTimestampsMs.insert(relDirPath, synced ? doneMs : (doneMs - kDirSyncTtlMs + 15000LL));
-                if (synced)
+                if (synced) {
                     mergeRcloneFolderJsonLocked(relDirPath, dirJson, true);
+                } else {
+                    m_syncedDirTimestampsMs.insert(relDirPath, doneMs - kDirSyncTtlMs + 15000LL);
+                }
             }
 
             if (synced) {
                 auto persistUpdatedCatalog = [this]() {
-                    saveState();
+                    if (m_isTestInstance)
+                        saveState();
+                    else
+                        scheduleSaveState(500);
                     rebuildFilteredModel();
                     emit statsChanged();
                 };
@@ -2651,7 +2932,42 @@ QStringList Backend::vfsReadDir(const QString &relDirPath, bool *existsOut, bool
     const bool foundDir = m_vfsDirs.contains(relDirPath);
     if (existsOut)
         *existsOut = foundDir;
-    return m_vfsDirChildren.value(relDirPath);
+    if (!foundDir)
+        return {};
+
+    const QStringList names = m_vfsDirChildren.value(relDirPath);
+    QList<VfsDirEntry> result;
+    result.reserve(names.size());
+    const qint64 nowSecs = QDateTime::currentSecsSinceEpoch();
+    for (const QString &name : names) {
+        const QString childPath = relDirPath.isEmpty() ? name : (relDirPath + QLatin1Char('/') + name);
+        VfsDirEntry item;
+        item.name = name;
+        const int idx = m_vfsFileIdx.value(childPath, -1);
+        if (idx >= 0 && idx < m_entries.size()) {
+            const auto &e = m_entries.at(idx);
+            item.sizeBytes = e.sizeBytes;
+            item.mtimeSecs = e.modifiedSecs;
+            item.isDir = false;
+            item.isResident = (e.state == QLatin1String("pinned") || e.state == QLatin1String("cached"));
+        } else {
+            item.sizeBytes = 4096;
+            item.mtimeSecs = nowSecs;
+            item.isDir = true;
+            item.isResident = true;
+        }
+        result.append(item);
+    }
+    return result;
+}
+
+QStringList Backend::vfsReadDir(const QString &relDirPath, bool *existsOut, bool allowRemoteSync) {
+    const QList<VfsDirEntry> entries = vfsReadDirEntries(relDirPath, existsOut, allowRemoteSync);
+    QStringList names;
+    names.reserve(entries.size());
+    for (const VfsDirEntry &e : entries)
+        names.append(e.name);
+    return names;
 }
 
 QString Backend::vfsOpenAndHydrate(const QString &relPath, bool forWrite, QString *errorOut) {
@@ -2769,7 +3085,10 @@ QString Backend::vfsOpenAndHydrate(const QString &relPath, bool forWrite, QStrin
     auto finishPostHydrate = [this, relPath, entryName, entrySize, wasCloudOnly, becameFrequent, newAccessCount]() {
         // Enforce cache ceiling while protecting the file currently being opened.
         enforceCacheBudget(relPath);
-        saveState();
+        if (m_isTestInstance)
+            saveState();
+        else
+            scheduleSaveState(400);
         if (wasCloudOnly) {
             logActivity(tr("Hydrated On-Demand"),
                         tr("Downloaded %1 (%2) to local cache (opened %3x)")
@@ -2814,13 +3133,9 @@ bool Backend::vfsCreateFile(const QString &relPath, QString *localCachePathOut) 
 
     {
         QMutexLocker locker(&m_mutex);
-        int idx = -1;
-        for (int i = 0; i < m_entries.size(); ++i) {
-            if (m_entries.at(i).path == relPath) {
-                idx = i;
-                break;
-            }
-        }
+        if (m_vfsFileIdx.isEmpty() && !m_entries.isEmpty())
+            rebuildVfsIndexLocked();
+        const int idx = m_vfsFileIdx.value(relPath, -1);
         const qint64 now = QDateTime::currentSecsSinceEpoch();
         if (idx < 0) {
             DriveFileEntry e;
@@ -2844,7 +3159,10 @@ bool Backend::vfsCreateFile(const QString &relPath, QString *localCachePathOut) 
         *localCachePathOut = blobPath;
 
     QMetaObject::invokeMethod(this, [this]() {
-        saveState();
+        if (m_isTestInstance)
+            saveState();
+        else
+            scheduleSaveState(400);
         rebuildFilteredModel();
     }, Qt::AutoConnection);
 
@@ -2859,20 +3177,24 @@ bool Backend::vfsWriteCompleted(const QString &relPath) {
 
     {
         QMutexLocker locker(&m_mutex);
-        for (int i = 0; i < m_entries.size(); ++i) {
-            if (m_entries.at(i).path == relPath) {
-                m_entries[i].sizeBytes = qMax<qint64>(fi.size(), m_entries[i].sizeBytes);
-                m_entries[i].modifiedSecs = QDateTime::currentSecsSinceEpoch();
-                m_entries[i].state = m_entries[i].pinned ? QStringLiteral("pinned") : QStringLiteral("cached");
-                syncProjectionForEntryLocked(m_entries[i]);
-                break;
-            }
+        if (m_vfsFileIdx.isEmpty() && !m_entries.isEmpty())
+            rebuildVfsIndexLocked();
+        const int idx = m_vfsFileIdx.value(relPath, -1);
+        if (idx >= 0 && idx < m_entries.size()) {
+            m_entries[idx].sizeBytes = qMax<qint64>(fi.size(), m_entries[idx].sizeBytes);
+            m_entries[idx].modifiedSecs = QDateTime::currentSecsSinceEpoch();
+            m_entries[idx].state = m_entries[idx].pinned ? QStringLiteral("pinned") : QStringLiteral("cached");
+            m_statsDirty = true;
+            syncProjectionForEntryLocked(m_entries[idx]);
         }
     }
 
     QMetaObject::invokeMethod(this, [this]() {
         enforceCacheBudget();
-        saveState();
+        if (m_isTestInstance)
+            saveState();
+        else
+            scheduleSaveState(400);
         rebuildFilteredModel();
     }, Qt::AutoConnection);
 
@@ -2883,25 +3205,248 @@ bool Backend::vfsUnlinkFile(const QString &relPath) {
     bool removed = false;
     {
         QMutexLocker locker(&m_mutex);
-        for (int i = 0; i < m_entries.size(); ++i) {
-            if (m_entries.at(i).path == relPath) {
-                const QString blobPath = localBlobPath(relPath);
-                if (QFileInfo::exists(blobPath))
-                    QFile::remove(blobPath);
-                m_entries.removeAt(i);
-                rebuildVfsIndexLocked();
-                removed = true;
-                break;
-            }
+        if (m_vfsFileIdx.isEmpty() && !m_entries.isEmpty())
+            rebuildVfsIndexLocked();
+        const int idx = m_vfsFileIdx.value(relPath, -1);
+        if (idx >= 0 && idx < m_entries.size()) {
+            const QString blobPath = localBlobPath(relPath);
+            if (QFileInfo::exists(blobPath))
+                QFile::remove(blobPath);
+            m_entries.removeAt(idx);
+            rebuildVfsIndexLocked();
+            removed = true;
         }
     }
     if (removed) {
         QMetaObject::invokeMethod(this, [this]() {
-            saveState();
+            if (m_isTestInstance)
+                saveState();
+            else
+                scheduleSaveState(400);
             rebuildFilteredModel();
         }, Qt::AutoConnection);
     }
     return removed;
+}
+
+int Backend::vfsMkdir(const QString &relPath) {
+    const QString rel = cleanRelPath(relPath);
+    if (rel.isEmpty() || rel == QLatin1String("."))
+        return -EEXIST;
+    if (rel == QLatin1String("Root"))
+        return -EINVAL;
+
+    auto validateLocked = [&]() -> int {
+        if (m_vfsFileIdx.isEmpty() && (!m_entries.isEmpty() || !m_remoteFolders.isEmpty()))
+            rebuildVfsIndexLocked();
+
+        if (m_vfsFileIdx.contains(rel) || m_vfsDirs.contains(rel))
+            return -EEXIST;
+
+        const int slash = rel.lastIndexOf('/');
+        const QString parent = (slash < 0) ? QString() : rel.left(slash);
+        if (!parent.isEmpty()) {
+            if (m_vfsFileIdx.contains(parent))
+                return -ENOTDIR;
+            if (!m_vfsDirs.contains(parent))
+                return -ENOENT;
+        }
+        return 0;
+    };
+
+    QString sourceMode;
+    bool rcloneActive = false;
+    QString rcloneBin;
+    QString remoteName;
+    QString remotePath;
+    QString rcloneConfigPath;
+    QString localSourceDir;
+
+    {
+        QMutexLocker locker(&m_mutex);
+        const int err = validateLocked();
+        if (err != 0)
+            return err;
+
+        sourceMode = m_sourceMode;
+        rcloneActive = (sourceMode == QLatin1String("rclone") && m_rcloneAvailable
+                        && !m_remoteName.isEmpty() && m_availableRemotes.contains(m_remoteName));
+        rcloneBin = m_rcloneBin;
+        remoteName = m_remoteName;
+        remotePath = m_remotePath;
+        rcloneConfigPath = m_rcloneConfigPath;
+        localSourceDir = m_localSourceDir;
+    }
+
+    if (rcloneActive) {
+        const QString spec = buildRcloneSpec(remoteName, remotePath, rel);
+        QString rcloneErr;
+        const bool created = runOnQtThread(this, [&]() {
+            return runRcloneMkdir(rcloneBin, spec, 30000, &rcloneErr, rcloneConfigPath);
+        });
+        if (!created) {
+            qWarning("wickfs: rclone mkdir %s failed: %s", qPrintable(spec), qPrintable(rcloneErr));
+            return -EIO;
+        }
+    } else if (sourceMode == QLatin1String("folder") && !localSourceDir.isEmpty()) {
+        const QString dstLocal = localSourceDir + QLatin1Char('/') + rel;
+        if (QFileInfo::exists(dstLocal))
+            return -EEXIST;
+        if (!QDir().mkpath(dstLocal))
+            return -EIO;
+    }
+
+    {
+        QMutexLocker locker(&m_mutex);
+        const int err = validateLocked();
+        if (err != 0)
+            return err;
+
+        if (!m_remoteFolders.contains(rel))
+            m_remoteFolders.append(rel);
+        m_listedDirs.insert(rel);
+        m_syncedDirTimestampsMs.insert(rel, QDateTime::currentMSecsSinceEpoch());
+
+        const bool kernelFuse = (m_fuseMount && m_fuseMount->isKernelFuse());
+        if (!m_mountDir.isEmpty() && !kernelFuse)
+            QDir().mkpath(m_mountDir + QLatin1Char('/') + rel);
+
+        rebuildVfsIndexLocked();
+    }
+
+    auto persistAndNotify = [this, rel]() {
+        saveState();
+        rebuildFilteredModel();
+        logActivity(tr("Created Folder"), rel, QStringLiteral("MKDIR"));
+        emit statsChanged();
+    };
+    if (QThread::currentThread() != this->thread())
+        QMetaObject::invokeMethod(this, persistAndNotify, Qt::QueuedConnection);
+    else
+        persistAndNotify();
+
+    return 0;
+}
+
+int Backend::vfsRmdir(const QString &relPath) {
+    const QString rel = cleanRelPath(relPath);
+    if (rel.isEmpty() || rel == QLatin1String("."))
+        return -EBUSY;
+
+    auto validateLocked = [&]() -> int {
+        if (m_vfsFileIdx.isEmpty() && (!m_entries.isEmpty() || !m_remoteFolders.isEmpty()))
+            rebuildVfsIndexLocked();
+
+        if (m_vfsFileIdx.contains(rel))
+            return -ENOTDIR;
+        if (!m_vfsDirs.contains(rel))
+            return -ENOENT;
+        if (!m_vfsDirChildren.value(rel).isEmpty())
+            return -ENOTEMPTY;
+
+        const QString prefix = rel + QLatin1Char('/');
+        for (const auto &e : m_entries) {
+            if (e.path.startsWith(prefix))
+                return -ENOTEMPTY;
+        }
+        for (const QString &rf : m_remoteFolders) {
+            if (rf.startsWith(prefix))
+                return -ENOTEMPTY;
+        }
+        return 0;
+    };
+
+    QString sourceMode;
+    bool rcloneActive = false;
+    QString rcloneBin;
+    QString remoteName;
+    QString remotePath;
+    QString rcloneConfigPath;
+    QString localSourceDir;
+
+    {
+        QMutexLocker locker(&m_mutex);
+        const int err = validateLocked();
+        if (err != 0)
+            return err;
+
+        sourceMode = m_sourceMode;
+        rcloneActive = (sourceMode == QLatin1String("rclone") && m_rcloneAvailable
+                        && !m_remoteName.isEmpty() && m_availableRemotes.contains(m_remoteName));
+        rcloneBin = m_rcloneBin;
+        remoteName = m_remoteName;
+        remotePath = m_remotePath;
+        rcloneConfigPath = m_rcloneConfigPath;
+        localSourceDir = m_localSourceDir;
+    }
+
+    if (rcloneActive) {
+        const QString spec = buildRcloneSpec(remoteName, remotePath, rel);
+        QString rcloneErr;
+        const bool removed = runOnQtThread(this, [&]() {
+            return runRcloneRmdir(rcloneBin, spec, 30000, &rcloneErr, rcloneConfigPath);
+        });
+        if (!removed) {
+            const QString lowerErr = rcloneErr.toLower();
+            if (lowerErr.contains(QLatin1String("not empty"))
+                || lowerErr.contains(QLatin1String("directory not empty"))) {
+                return -ENOTEMPTY;
+            }
+            if (!isRcloneNotFoundError(rcloneErr)) {
+                qWarning("wickfs: rclone rmdir %s failed: %s", qPrintable(spec), qPrintable(rcloneErr));
+                return -EIO;
+            }
+        }
+    } else if (sourceMode == QLatin1String("folder") && !localSourceDir.isEmpty()) {
+        const QString dstLocal = localSourceDir + QLatin1Char('/') + rel;
+        if (QDir(dstLocal).exists() && !QDir().rmdir(dstLocal)) {
+            const bool nonEmpty = !QDir(dstLocal).entryList(QDir::NoDotAndDotDot | QDir::AllEntries
+                                                            | QDir::Hidden | QDir::System).isEmpty();
+            return nonEmpty ? -ENOTEMPTY : -EIO;
+        }
+    }
+
+    bool currentFolderChanged = false;
+    {
+        QMutexLocker locker(&m_mutex);
+        const int err = validateLocked();
+        if (err != 0)
+            return err;
+
+        m_remoteFolders.removeAll(rel);
+        m_listedDirs.remove(rel);
+        m_syncedDirTimestampsMs.remove(rel);
+
+        const QString blobDir = localBlobPath(rel);
+        if (QDir(blobDir).exists())
+            QDir().rmdir(blobDir);
+
+        const bool kernelFuse = (m_fuseMount && m_fuseMount->isKernelFuse());
+        if (!m_mountDir.isEmpty() && !kernelFuse)
+            QDir().rmdir(m_mountDir + QLatin1Char('/') + rel);
+
+        if (m_currentFolder == rel) {
+            m_currentFolder.clear();
+            currentFolderChanged = true;
+        }
+
+        rebuildVfsIndexLocked();
+    }
+
+    auto persistAndNotify = [this, rel, currentFolderChanged]() {
+        saveState();
+        rebuildFilteredModel();
+        if (currentFolderChanged)
+            emit filterChanged();
+        logActivity(tr("Removed Folder"), rel, QStringLiteral("RMDIR"));
+        emit statsChanged();
+    };
+    if (QThread::currentThread() != this->thread())
+        QMetaObject::invokeMethod(this, persistAndNotify, Qt::QueuedConnection);
+    else
+        persistAndNotify();
+
+    return 0;
 }
 
 int Backend::vfsRename(const QString &oldRelPath, const QString &newRelPath, unsigned int flags) {
@@ -3026,10 +3571,10 @@ int Backend::vfsRename(const QString &oldRelPath, const QString &newRelPath, uns
         bool moved = false;
         QString rcloneErr;
         if (QThread::currentThread() == this->thread()) {
-            moved = runRcloneMoveto(rcloneBin, srcSpec, dstSpec, 25000, &rcloneErr, rcloneConfigPath);
+            moved = runRcloneMoveto(rcloneBin, srcSpec, dstSpec, 45000, &rcloneErr, rcloneConfigPath);
         } else {
             std::unique_ptr<QThread> worker(QThread::create([&]() {
-                moved = runRcloneMoveto(rcloneBin, srcSpec, dstSpec, 25000, &rcloneErr, rcloneConfigPath);
+                moved = runRcloneMoveto(rcloneBin, srcSpec, dstSpec, 45000, &rcloneErr, rcloneConfigPath);
             }));
             worker->start();
             worker->wait();
@@ -3159,6 +3704,17 @@ int Backend::vfsRename(const QString &oldRelPath, const QString &newRelPath, uns
             }
             m_syncedDirTimestampsMs = nextTimestamps;
 
+            QSet<QString> nextListed;
+            for (const QString &ld : std::as_const(m_listedDirs)) {
+                if (ld == oldRel)
+                    nextListed.insert(newRel);
+                else if (ld.startsWith(oldPrefix))
+                    nextListed.insert(newPrefix + ld.mid(oldPrefix.size()));
+                else
+                    nextListed.insert(ld);
+            }
+            m_listedDirs = nextListed;
+
             if (m_currentFolder == oldRel) {
                 m_currentFolder = newRel;
                 currentFolderChanged = true;
@@ -3199,10 +3755,11 @@ QList<DriveFileEntry> Backend::allEntries() const {
 
 DriveFileEntry Backend::entryForPath(const QString &path) const {
     QMutexLocker locker(&m_mutex);
-    for (const auto &e : m_entries) {
-        if (e.path == path)
-            return e;
-    }
+    if (m_vfsFileIdx.isEmpty() && !m_entries.isEmpty())
+        rebuildVfsIndexLocked();
+    const int idx = m_vfsFileIdx.value(path, -1);
+    if (idx >= 0 && idx < m_entries.size())
+        return m_entries.at(idx);
     return {};
 }
 
@@ -3259,8 +3816,24 @@ void Backend::loadState() {
             m_remoteFolders.append(rf);
     }
 
+    m_listedDirs.clear();
+    const bool hasListedDirsKey = root.contains("listedDirs");
+    if (hasListedDirsKey) {
+        const QJsonArray ldArr = root.value("listedDirs").toArray();
+        for (const auto &v : ldArr)
+            m_listedDirs.insert(v.toString());
+    }
+
+    m_syncedDirTimestampsMs.clear();
+    if (root.contains("syncedDirTimestampsMs")) {
+        const QJsonObject tsObj = root.value("syncedDirTimestampsMs").toObject();
+        for (auto it = tsObj.begin(); it != tsObj.end(); ++it)
+            m_syncedDirTimestampsMs.insert(it.key(), static_cast<qint64>(it.value().toDouble(0)));
+    }
+
     m_entries.clear();
     const QJsonArray arr = root.value("entries").toArray();
+    m_entries.reserve(arr.size());
     for (const auto &v : arr) {
         const QJsonObject o = v.toObject();
         DriveFileEntry e;
@@ -3280,7 +3853,14 @@ void Backend::loadState() {
     recomputeScoresLocked();
     for (int i = 0; i < m_entries.size(); ++i) {
         if (m_entries[i].state == QLatin1String("pinned") || m_entries[i].state == QLatin1String("cached")) {
-            if (QFileInfo::exists(localBlobPath(m_entries[i].path)) || m_sourceMode != QLatin1String("rclone")) {
+            const QString blobPath = localBlobPath(m_entries[i].path);
+            const QFileInfo blobFi(blobPath);
+            if (blobFi.exists()) {
+                if (m_sourceMode == QLatin1String("rclone") && blobFi.size() > 0)
+                    m_entries[i].sizeBytes = blobFi.size();
+                m_entries[i].state = m_entries[i].pinned ? QStringLiteral("pinned") : QStringLiteral("cached");
+                syncProjectionForEntryLocked(m_entries[i]);
+            } else if (m_sourceMode != QLatin1String("rclone")) {
                 hydrateEntryLocked(i);
             } else if (!m_entries[i].pinned) {
                 m_entries[i].state = QStringLiteral("cloud");
@@ -3288,6 +3868,13 @@ void Backend::loadState() {
         }
     }
     rebuildVfsIndexLocked();
+    if (!hasListedDirsKey) {
+        m_listedDirs.insert(QString());
+        for (auto it = m_vfsDirChildren.cbegin(); it != m_vfsDirChildren.cend(); ++it) {
+            if (!it.value().isEmpty())
+                m_listedDirs.insert(it.key());
+        }
+    }
     const QFileInfo loadedFi(m_stateDir + "/state.json");
     m_lastLoadedStateMtimeMs = loadedFi.lastModified().toMSecsSinceEpoch();
     m_lastLoadedStateSize = loadedFi.size();
@@ -3295,50 +3882,143 @@ void Backend::loadState() {
     rebuildFilteredModel();
 }
 
+void Backend::scheduleSaveState(int delayMs) {
+    if (QThread::currentThread() == this->thread()) {
+        if (!m_saveDebounceTimer.isActive())
+            m_saveDebounceTimer.start(delayMs);
+    } else {
+        QMetaObject::invokeMethod(this, [this, delayMs]() {
+            if (!m_saveDebounceTimer.isActive())
+                m_saveDebounceTimer.start(delayMs);
+        }, Qt::QueuedConnection);
+    }
+}
+
 void Backend::saveState() const {
-    QMutexLocker locker(&m_mutex);
-    QDir().mkpath(m_stateDir);
+    QJsonObject root;
+    QJsonObject barRoot;
+    QString stateDir;
 
-    QJsonArray rfArr;
-    for (const QString &rf : m_remoteFolders)
-        rfArr.append(rf);
+    {
+        QMutexLocker locker(&m_mutex);
+        ensureStatsFreshLocked();
+        stateDir = m_stateDir;
 
-    QJsonArray arr;
-    for (const auto &e : m_entries) {
-        QJsonObject o;
-        o.insert("path", e.path);
-        o.insert("name", e.name);
-        o.insert("folder", e.folder);
-        o.insert("category", e.category);
-        o.insert("sizeBytes", static_cast<double>(e.sizeBytes));
-        o.insert("modifiedSecs", static_cast<double>(e.modifiedSecs));
-        o.insert("state", e.state);
-        o.insert("pinned", e.pinned);
-        o.insert("accessCount", e.accessCount);
-        o.insert("lastAccessedSecs", static_cast<double>(e.lastAccessedSecs));
-        arr.append(o);
+        QJsonArray rfArr;
+        for (const QString &rf : m_remoteFolders)
+            rfArr.append(rf);
+
+        QJsonArray ldArr;
+        for (const QString &ld : m_listedDirs)
+            ldArr.append(ld);
+
+        QJsonObject tsObj;
+        for (auto it = m_syncedDirTimestampsMs.cbegin(); it != m_syncedDirTimestampsMs.cend(); ++it) {
+            if (it.value() > 0)
+                tsObj.insert(it.key(), static_cast<double>(it.value()));
+        }
+
+        QJsonArray arr;
+        for (const auto &e : m_entries) {
+            QJsonObject o;
+            o.insert("path", e.path);
+            o.insert("name", e.name);
+            o.insert("folder", e.folder);
+            o.insert("category", e.category);
+            o.insert("sizeBytes", static_cast<double>(e.sizeBytes));
+            o.insert("modifiedSecs", static_cast<double>(e.modifiedSecs));
+            o.insert("state", e.state);
+            o.insert("pinned", e.pinned);
+            o.insert("accessCount", e.accessCount);
+            o.insert("lastAccessedSecs", static_cast<double>(e.lastAccessedSecs));
+            arr.append(o);
+        }
+
+        root.insert("sourceMode", m_sourceMode);
+        root.insert("remoteName", m_remoteName);
+        root.insert("remotePath", m_remotePath);
+        root.insert("localSourceDir", m_localSourceDir);
+        root.insert("maxCacheBytes", static_cast<double>(m_maxCacheBytes));
+        root.insert("minFreeDiskBytes", static_cast<double>(m_minFreeDiskBytes));
+        root.insert("frequentThreshold", m_frequentThreshold);
+        root.insert("halfLifeHours", m_halfLifeHours);
+        root.insert("autoKeepFrequent", m_autoKeepFrequent);
+        root.insert("lastSyncedSecs", static_cast<double>(m_lastSyncedSecs));
+        root.insert("syncing", m_syncing);
+        root.insert("syncState", syncState());
+        root.insert("activeSyncFile", m_activeSyncFile);
+        root.insert("syncProgress", m_syncProgress);
+        root.insert("pendingSyncCount", m_pendingSyncCount);
+        root.insert("remoteFolders", rfArr);
+        root.insert("listedDirs", ldArr);
+        root.insert("syncedDirTimestampsMs", tsObj);
+        root.insert("entries", arr);
+
+        // Compact summary payload for the Omarchy top-bar widget (bar-status.json)
+        QList<int> topIndices;
+        topIndices.reserve(m_entries.size());
+        for (int i = 0; i < m_entries.size(); ++i)
+            topIndices.append(i);
+        const int topLimit = qMin(6, topIndices.size());
+        std::partial_sort(topIndices.begin(), topIndices.begin() + topLimit, topIndices.end(),
+                          [this](int a, int b) {
+            const auto &ea = m_entries.at(a);
+            const auto &eb = m_entries.at(b);
+            if (ea.pinned != eb.pinned)
+                return ea.pinned > eb.pinned;
+            const bool aRes = (ea.state != QLatin1String("cloud"));
+            const bool bRes = (eb.state != QLatin1String("cloud"));
+            if (aRes != bRes)
+                return aRes > bRes;
+            return ea.accessCount > eb.accessCount;
+        });
+
+        QJsonArray topFiles;
+        for (int k = 0; k < topLimit; ++k) {
+            const auto &e = m_entries.at(topIndices.at(k));
+            QJsonObject o;
+            o.insert("name", e.name);
+            o.insert("folder", e.folder);
+            o.insert("sizeBytes", static_cast<double>(e.sizeBytes));
+            o.insert("state", e.state);
+            o.insert("pinned", e.pinned);
+            o.insert("accessCount", e.accessCount);
+            o.insert("isFrequent", e.isFrequent);
+            topFiles.append(o);
+        }
+
+        const qint64 saved = qMax<qint64>(0, m_cachedTotalCloudBytes - m_cachedCachedBytes);
+        const int savedPct = m_cachedTotalCloudBytes > 0
+            ? qBound(0, static_cast<int>(std::round((static_cast<double>(saved) * 100.0) / static_cast<double>(m_cachedTotalCloudBytes))), 100)
+            : 0;
+
+        barRoot.insert("barSummary", true);
+        barRoot.insert("sourceMode", m_sourceMode);
+        barRoot.insert("remoteName", m_remoteName);
+        barRoot.insert("maxCacheBytes", static_cast<double>(m_maxCacheBytes));
+        barRoot.insert("cachedBytes", static_cast<double>(m_cachedCachedBytes));
+        barRoot.insert("pinnedBytes", static_cast<double>(m_cachedPinnedBytes));
+        barRoot.insert("hotCachedBytes", static_cast<double>(m_cachedHotCachedBytes));
+        barRoot.insert("totalCloudBytes", static_cast<double>(m_cachedTotalCloudBytes));
+        barRoot.insert("savedBytes", static_cast<double>(saved));
+        barRoot.insert("savedPct", savedPct);
+        barRoot.insert("totalFiles", m_entries.size());
+        barRoot.insert("cachedFiles", m_cachedCachedCount);
+        barRoot.insert("pinnedFiles", m_cachedPinnedCount);
+        barRoot.insert("frequentFiles", m_cachedFrequentCount);
+        barRoot.insert("cloudOnlyFiles", m_cachedCloudCount);
+        barRoot.insert("lastSyncedSecs", static_cast<double>(m_lastSyncedSecs));
+        barRoot.insert("syncing", m_syncing);
+        barRoot.insert("syncState", syncState());
+        barRoot.insert("activeSyncFile", m_activeSyncFile);
+        barRoot.insert("syncProgress", m_syncProgress);
+        barRoot.insert("pendingSyncCount", m_pendingSyncCount);
+        barRoot.insert("entries", topFiles);
     }
 
-    QJsonObject root;
-    root.insert("sourceMode", m_sourceMode);
-    root.insert("remoteName", m_remoteName);
-    root.insert("remotePath", m_remotePath);
-    root.insert("localSourceDir", m_localSourceDir);
-    root.insert("maxCacheBytes", static_cast<double>(m_maxCacheBytes));
-    root.insert("minFreeDiskBytes", static_cast<double>(m_minFreeDiskBytes));
-    root.insert("frequentThreshold", m_frequentThreshold);
-    root.insert("halfLifeHours", m_halfLifeHours);
-    root.insert("autoKeepFrequent", m_autoKeepFrequent);
-    root.insert("lastSyncedSecs", static_cast<double>(m_lastSyncedSecs));
-    root.insert("syncing", m_syncing);
-    root.insert("syncState", syncState());
-    root.insert("activeSyncFile", m_activeSyncFile);
-    root.insert("syncProgress", m_syncProgress);
-    root.insert("pendingSyncCount", m_pendingSyncCount);
-    root.insert("remoteFolders", rfArr);
-    root.insert("entries", arr);
-
-    const QString statePath = m_stateDir + "/state.json";
+    // Perform JSON serialization and atomic disk I/O completely outside m_mutex.
+    QDir().mkpath(stateDir);
+    const QString statePath = stateDir + "/state.json";
     QSaveFile f(statePath);
     if (f.open(QIODevice::WriteOnly)) {
         f.write(QJsonDocument(root).toJson(QJsonDocument::Compact));
@@ -3346,6 +4026,13 @@ void Backend::saveState() const {
         const QFileInfo savedFi(statePath);
         m_lastLoadedStateMtimeMs = savedFi.lastModified().toMSecsSinceEpoch();
         m_lastLoadedStateSize = savedFi.size();
+    }
+
+    const QString barPath = stateDir + "/bar-status.json";
+    QSaveFile bf(barPath);
+    if (bf.open(QIODevice::WriteOnly)) {
+        bf.write(QJsonDocument(barRoot).toJson(QJsonDocument::Compact));
+        bf.commit();
     }
 }
 

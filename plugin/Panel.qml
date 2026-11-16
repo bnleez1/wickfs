@@ -86,7 +86,7 @@ Panel {
     id: stateProc
     command: [
       "sh", "-c",
-      "cat \"$HOME/.local/share/wickfs/state.json\" 2>/dev/null || true"
+      "cat \"$HOME/.local/share/wickfs/bar-status.json\" 2>/dev/null || cat \"$HOME/.local/share/wickfs/state.json\" 2>/dev/null || true"
     ]
     stdout: StdioCollector {
       waitForEnd: true
@@ -115,7 +115,7 @@ Panel {
 
   Timer {
     id: pollTimer
-    interval: 2000
+    interval: 3000
     running: true
     repeat: true
     triggeredOnStart: true

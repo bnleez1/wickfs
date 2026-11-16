@@ -58,7 +58,7 @@ function parseStateJson(rawText, nowMs) {
 
   if (!rawText || typeof rawText !== "string") return empty
   var trimmed = rawText.trim()
-  if (!trimmed || trimmed.length > 262144) return empty
+  if (!trimmed || trimmed.length > 8388608) return empty
 
   var obj = null
   try {
@@ -70,7 +70,7 @@ function parseStateJson(rawText, nowMs) {
 
   var maxCache = clampNum(obj.maxCacheBytes, 1024 * 1024, 1e14, empty.maxCacheBytes)
   var threshold = clampNum(obj.frequentThreshold, 1, 100, 3)
-  var rawEntries = Array.isArray(obj.entries) ? obj.entries.slice(0, 64) : []
+  var rawEntries = Array.isArray(obj.entries) ? obj.entries : []
 
   var totalCloud = 0
   var cachedBytes = 0
@@ -92,22 +92,24 @@ function parseStateJson(rawText, nowMs) {
     var state = pinned ? "pinned" : sanitizeText(it.state || "cloud", 16)
     if (state !== "pinned" && state !== "cached" && state !== "cloud") state = "cloud"
     var accessCount = clampNum(it.accessCount, 0, 100000, 0)
-    var isFrequent = accessCount >= threshold
+    var isFrequent = (typeof it.isFrequent === "boolean") ? it.isFrequent : (accessCount >= threshold)
 
-    totalCloud += sizeBytes
-    if (pinned) {
-      pinnedBytes += sizeBytes
-      cachedBytes += sizeBytes
-      pinnedFiles += 1
-      cachedFiles += 1
-    } else if (state === "cached") {
-      hotCachedBytes += sizeBytes
-      cachedBytes += sizeBytes
-      cachedFiles += 1
-    } else {
-      cloudOnlyFiles += 1
+    if (!obj.barSummary) {
+      totalCloud += sizeBytes
+      if (pinned) {
+        pinnedBytes += sizeBytes
+        cachedBytes += sizeBytes
+        pinnedFiles += 1
+        cachedFiles += 1
+      } else if (state === "cached") {
+        hotCachedBytes += sizeBytes
+        cachedBytes += sizeBytes
+        cachedFiles += 1
+      } else {
+        cloudOnlyFiles += 1
+      }
+      if (isFrequent) frequentFiles += 1
     }
-    if (isFrequent) frequentFiles += 1
 
     parsedFiles.push({
       name: name,
@@ -125,6 +127,19 @@ function parseStateJson(rawText, nowMs) {
     if ((a.state !== "cloud") !== (b.state !== "cloud")) return a.state !== "cloud" ? -1 : 1
     return b.accessCount - a.accessCount
   })
+
+  var totalFiles = rawEntries.length
+  if (obj.barSummary) {
+    totalCloud = clampNum(obj.totalCloudBytes, 0, 1e15, 0)
+    cachedBytes = clampNum(obj.cachedBytes, 0, 1e15, 0)
+    pinnedBytes = clampNum(obj.pinnedBytes, 0, 1e15, 0)
+    hotCachedBytes = clampNum(obj.hotCachedBytes, 0, 1e15, 0)
+    totalFiles = clampNum(obj.totalFiles, 0, 10000000, parsedFiles.length)
+    cachedFiles = clampNum(obj.cachedFiles, 0, 10000000, 0)
+    pinnedFiles = clampNum(obj.pinnedFiles, 0, 10000000, 0)
+    frequentFiles = clampNum(obj.frequentFiles, 0, 10000000, 0)
+    cloudOnlyFiles = clampNum(obj.cloudOnlyFiles, 0, 10000000, 0)
+  }
 
   var savedBytes = Math.max(0, totalCloud - cachedBytes)
   var savedPct = totalCloud > 0 ? Math.round((savedBytes * 100) / totalCloud) : 0
@@ -151,7 +166,7 @@ function parseStateJson(rawText, nowMs) {
     totalCloudBytes: totalCloud,
     savedBytes: savedBytes,
     savedPct: savedPct,
-    totalFiles: parsedFiles.length,
+    totalFiles: totalFiles,
     cachedFiles: cachedFiles,
     pinnedFiles: pinnedFiles,
     frequentFiles: frequentFiles,

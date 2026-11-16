@@ -1,12 +1,15 @@
-#define FUSE_USE_VERSION 35
+#define FUSE_USE_VERSION 312
 #include <fuse3/fuse.h>
 
 #include "fusemount.h"
 #include "backend.h"
 
+#include <QDateTime>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QHash>
+#include <QPair>
 #include <QProcess>
 #include <QStandardPaths>
 #include <cerrno>
@@ -21,6 +24,18 @@ namespace {
 bool isBackgroundIndexerOrThumbnailer(pid_t pid) {
     if (pid <= 1)
         return false;
+
+    static std::mutex s_cacheMutex;
+    static QHash<pid_t, QPair<bool, qint64>> s_pidCache;
+    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+    {
+        std::lock_guard<std::mutex> lock(s_cacheMutex);
+        auto it = s_pidCache.constFind(pid);
+        if (it != s_pidCache.constEnd() && it->second > nowMs)
+            return it->first;
+    }
+
+    bool matched = false;
     QFile comm(QStringLiteral("/proc/%1/comm").arg(pid));
     if (comm.open(QIODevice::ReadOnly)) {
         const QString name = QString::fromUtf8(comm.readAll()).trimmed().toLower();
@@ -37,11 +52,20 @@ bool isBackgroundIndexerOrThumbnailer(pid_t pid) {
             QStringLiteral("gsf-office")
         };
         for (const QString &pfx : kSkipPrefixes) {
-            if (name.startsWith(pfx))
-                return true;
+            if (name.startsWith(pfx)) {
+                matched = true;
+                break;
+            }
         }
     }
-    return false;
+
+    {
+        std::lock_guard<std::mutex> lock(s_cacheMutex);
+        if (s_pidCache.size() > 256)
+            s_pidCache.clear();
+        s_pidCache.insert(pid, qMakePair(matched, nowMs + 10000LL));
+    }
+    return matched;
 }
 
 QString normalizeRelPath(const char *rawPath) {
@@ -60,6 +84,29 @@ FuseMount *currentMount() {
     return ctx ? static_cast<FuseMount *>(ctx->private_data) : nullptr;
 }
 
+void fillStatFromFields(struct stat *stbuf, uid_t uid, gid_t gid,
+                         qint64 sizeBytes, qint64 mtimeSecs, bool isDir, bool isResident) {
+    std::memset(stbuf, 0, sizeof(struct stat));
+    stbuf->st_uid = uid;
+    stbuf->st_gid = gid;
+    stbuf->st_atim.tv_sec = mtimeSecs;
+    stbuf->st_mtim.tv_sec = mtimeSecs;
+    stbuf->st_ctim.tv_sec = mtimeSecs;
+
+    if (isDir) {
+        stbuf->st_mode = S_IFDIR | 0755;
+        stbuf->st_nlink = 2;
+        stbuf->st_size = 4096;
+        stbuf->st_blocks = 8;
+    } else {
+        stbuf->st_mode = S_IFREG | 0644;
+        stbuf->st_nlink = 1;
+        stbuf->st_size = static_cast<off_t>(sizeBytes);
+        // Cloud-only stubs report 0 allocated disk blocks until hydrated.
+        stbuf->st_blocks = isResident ? static_cast<blkcnt_t>((sizeBytes + 511) / 512) : 0;
+    }
+}
+
 int fuseGetattrCb(const char *path, struct stat *stbuf, struct fuse_file_info *) {
     FuseMount *m = currentMount();
     if (!m)
@@ -68,20 +115,26 @@ int fuseGetattrCb(const char *path, struct stat *stbuf, struct fuse_file_info *)
 }
 
 int fuseReaddirCb(const char *path, void *buf, fuse_fill_dir_t filler, off_t,
-                  struct fuse_file_info *, enum fuse_readdir_flags) {
+                  struct fuse_file_info *, enum fuse_readdir_flags flags) {
     FuseMount *m = currentMount();
     if (!m)
         return -EIO;
     int err = 0;
-    const QStringList entries = m->handleReaddir(path, &err);
+    const QList<VfsDirEntry> entries = m->handleReaddirEntries(path, &err);
     if (err != 0)
         return err;
 
     filler(buf, ".", nullptr, 0, FUSE_FILL_DIR_DEFAULTS);
     filler(buf, "..", nullptr, 0, FUSE_FILL_DIR_DEFAULTS);
-    for (const QString &name : entries) {
-        const QByteArray utf8 = name.toUtf8();
-        filler(buf, utf8.constData(), nullptr, 0, FUSE_FILL_DIR_DEFAULTS);
+    const bool plus = (flags & FUSE_READDIR_PLUS) != 0;
+    const enum fuse_fill_dir_flags fillFlag = plus ? FUSE_FILL_DIR_PLUS : FUSE_FILL_DIR_DEFAULTS;
+    const uid_t uid = ::getuid();
+    const gid_t gid = ::getgid();
+    for (const VfsDirEntry &entry : entries) {
+        struct stat st {};
+        fillStatFromFields(&st, uid, gid, entry.sizeBytes, entry.mtimeSecs, entry.isDir, entry.isResident);
+        const QByteArray utf8 = entry.name.toUtf8();
+        filler(buf, utf8.constData(), &st, 0, fillFlag);
     }
     return 0;
 }
@@ -196,6 +249,20 @@ int fuseUnlinkCb(const char *path) {
     return m->handleUnlink(path);
 }
 
+int fuseMkdirCb(const char *path, mode_t mode) {
+    FuseMount *m = currentMount();
+    if (!m)
+        return -EIO;
+    return m->handleMkdir(path, mode);
+}
+
+int fuseRmdirCb(const char *path) {
+    FuseMount *m = currentMount();
+    if (!m)
+        return -EIO;
+    return m->handleRmdir(path);
+}
+
 int fuseRenameCb(const char *oldPath, const char *newPath, unsigned int flags) {
     FuseMount *m = currentMount();
     if (!m)
@@ -203,17 +270,29 @@ int fuseRenameCb(const char *oldPath, const char *newPath, unsigned int flags) {
     return m->handleRename(oldPath, newPath, flags);
 }
 
-int fuseUtimensCb(const char *path, const struct timespec tv[2], struct fuse_file_info *) {
-    FuseMount *m = currentMount();
+int checkPathExists(FuseMount *m, const char *path) {
     if (!m || !m->backend())
         return -EIO;
     const QString rel = normalizeRelPath(path);
     qint64 sz = 0, mtime = 0;
     bool isDir = false, isRes = false;
-    if (!m->backend()->vfsStat(rel, &sz, &mtime, &isDir, &isRes))
-        return -ENOENT;
+    return m->backend()->vfsStat(rel, &sz, &mtime, &isDir, &isRes) ? 0 : -ENOENT;
+}
+
+int fuseUtimensCb(const char *path, const struct timespec tv[2], struct fuse_file_info *) {
     Q_UNUSED(tv);
-    return 0;
+    return checkPathExists(currentMount(), path);
+}
+
+int fuseChmodCb(const char *path, mode_t mode, struct fuse_file_info *) {
+    Q_UNUSED(mode);
+    return checkPathExists(currentMount(), path);
+}
+
+int fuseChownCb(const char *path, uid_t uid, gid_t gid, struct fuse_file_info *) {
+    Q_UNUSED(uid);
+    Q_UNUSED(gid);
+    return checkPathExists(currentMount(), path);
 }
 
 int fuseStatfsCb(const char *, struct statvfs *stbuf) {
@@ -229,10 +308,11 @@ int fuseStatfsCb(const char *, struct statvfs *stbuf) {
 
 void *fuseInitCb(struct fuse_conn_info *, struct fuse_config *cfg) {
     if (cfg) {
-        cfg->entry_timeout = 10.0;
-        cfg->attr_timeout = 10.0;
-        cfg->negative_timeout = 5.0;
+        cfg->entry_timeout = 60.0;
+        cfg->attr_timeout = 60.0;
+        cfg->negative_timeout = 15.0;
         cfg->auto_cache = 1;
+        cfg->no_rofd_flush = 1;
     }
     struct fuse_context *ctx = fuse_get_context();
     return ctx ? ctx->private_data : nullptr;
@@ -243,6 +323,8 @@ struct fuse_operations buildOperations() {
     ops.init = fuseInitCb;
     ops.getattr = fuseGetattrCb;
     ops.readdir = fuseReaddirCb;
+    ops.mkdir = fuseMkdirCb;
+    ops.rmdir = fuseRmdirCb;
     ops.open = fuseOpenCb;
     ops.create = fuseCreateCb;
     ops.read = fuseReadCb;
@@ -252,6 +334,8 @@ struct fuse_operations buildOperations() {
     ops.unlink = fuseUnlinkCb;
     ops.rename = fuseRenameCb;
     ops.utimens = fuseUtimensCb;
+    ops.chmod = fuseChmodCb;
+    ops.chown = fuseChownCb;
     ops.statfs = fuseStatfsCb;
     return ops;
 }
@@ -270,7 +354,6 @@ FuseMount::~FuseMount() {
 int FuseMount::handleGetattr(const char *path, struct stat *stbuf) {
     if (!stbuf || !m_backend)
         return -EIO;
-    std::memset(stbuf, 0, sizeof(struct stat));
 
     const QString rel = normalizeRelPath(path);
     qint64 sizeBytes = 0;
@@ -281,28 +364,11 @@ int FuseMount::handleGetattr(const char *path, struct stat *stbuf) {
     if (!m_backend->vfsStat(rel, &sizeBytes, &mtimeSecs, &isDir, &isResident))
         return -ENOENT;
 
-    stbuf->st_uid = ::getuid();
-    stbuf->st_gid = ::getgid();
-    stbuf->st_atim.tv_sec = mtimeSecs;
-    stbuf->st_mtim.tv_sec = mtimeSecs;
-    stbuf->st_ctim.tv_sec = mtimeSecs;
-
-    if (isDir) {
-        stbuf->st_mode = S_IFDIR | 0755;
-        stbuf->st_nlink = 2;
-        stbuf->st_size = 4096;
-        stbuf->st_blocks = 8;
-    } else {
-        stbuf->st_mode = S_IFREG | 0644;
-        stbuf->st_nlink = 1;
-        stbuf->st_size = static_cast<off_t>(sizeBytes);
-        // Cloud-only stubs report 0 allocated disk blocks until hydrated.
-        stbuf->st_blocks = isResident ? static_cast<blkcnt_t>((sizeBytes + 511) / 512) : 0;
-    }
+    fillStatFromFields(stbuf, ::getuid(), ::getgid(), sizeBytes, mtimeSecs, isDir, isResident);
     return 0;
 }
 
-QStringList FuseMount::handleReaddir(const char *path, int *errOut) {
+QList<VfsDirEntry> FuseMount::handleReaddirEntries(const char *path, int *errOut) {
     if (errOut)
         *errOut = 0;
     if (!m_backend) {
@@ -314,9 +380,18 @@ QStringList FuseMount::handleReaddir(const char *path, int *errOut) {
     struct fuse_context *ctx = fuse_get_context();
     const bool allowRemoteSync = !(ctx && isBackgroundIndexerOrThumbnailer(ctx->pid));
     bool exists = false;
-    const QStringList list = m_backend->vfsReadDir(rel, &exists, allowRemoteSync);
+    const QList<VfsDirEntry> entries = m_backend->vfsReadDirEntries(rel, &exists, allowRemoteSync);
     if (!exists && errOut)
         *errOut = -ENOENT;
+    return entries;
+}
+
+QStringList FuseMount::handleReaddir(const char *path, int *errOut) {
+    const QList<VfsDirEntry> entries = handleReaddirEntries(path, errOut);
+    QStringList list;
+    list.reserve(entries.size());
+    for (const VfsDirEntry &e : entries)
+        list.append(e.name);
     return list;
 }
 
@@ -369,6 +444,19 @@ int FuseMount::handleUnlink(const char *path) {
     return m_backend->vfsUnlinkFile(rel) ? 0 : -ENOENT;
 }
 
+int FuseMount::handleMkdir(const char *path, mode_t mode) {
+    Q_UNUSED(mode);
+    if (!m_backend)
+        return -EIO;
+    return m_backend->vfsMkdir(normalizeRelPath(path));
+}
+
+int FuseMount::handleRmdir(const char *path) {
+    if (!m_backend)
+        return -EIO;
+    return m_backend->vfsRmdir(normalizeRelPath(path));
+}
+
 int FuseMount::handleRename(const char *oldPath, const char *newPath, unsigned int flags) {
     if (!m_backend)
         return -EIO;
@@ -389,6 +477,21 @@ bool FuseMount::isExternalFuseMounted(const QString &mountPoint) {
         }
     }
     return false;
+}
+
+void FuseMount::invalidatePath(const QString &relPath) {
+    if (!m_ownsFuse.load() || !m_kernelFuse.load())
+        return;
+    std::lock_guard<std::mutex> ptrLock(m_fusePtrMutex);
+    if (!m_fuse || !m_ownsFuse.load() || !m_kernelFuse.load())
+        return;
+    QString clean = relPath;
+    while (clean.startsWith('/'))
+        clean.remove(0, 1);
+    while (clean.endsWith('/'))
+        clean.chop(1);
+    const QByteArray absPath = clean.isEmpty() ? QByteArray("/") : (QByteArray("/") + clean.toUtf8());
+    fuse_invalidate_path(m_fuse, absPath.constData());
 }
 
 bool FuseMount::mount(const QString &mountPoint, QString *errorOut) {
@@ -447,7 +550,15 @@ bool FuseMount::mount(const QString &mountPoint, QString *errorOut) {
                     m_ownsFuse.store(true);
                     m_lastError.clear();
                     m_thread = std::thread([this]() {
-                        fuse_loop(m_fuse);
+                        struct fuse_loop_config *loopCfg = fuse_loop_cfg_create();
+                        if (loopCfg) {
+                            fuse_loop_cfg_set_max_threads(loopCfg, 8);
+                            fuse_loop_cfg_set_idle_threads(loopCfg, 2);
+                            fuse_loop_mt(m_fuse, loopCfg);
+                            fuse_loop_cfg_destroy(loopCfg);
+                        } else {
+                            fuse_loop(m_fuse);
+                        }
                     });
                     emit stateChanged();
                     return true;
@@ -483,7 +594,12 @@ void FuseMount::unmount() {
     if (!m_mounted.load())
         return;
 
-    if (m_ownsFuse.load() && m_kernelFuse.load() && m_fuse) {
+    const bool owns = m_ownsFuse.load();
+    const bool kernel = m_kernelFuse.load();
+    m_kernelFuse.store(false);
+    m_ownsFuse.store(false);
+
+    if (owns && kernel && m_fuse) {
         fuse_exit(m_fuse);
         const QString fusermountBin = QStandardPaths::findExecutable("fusermount3");
         if (!fusermountBin.isEmpty() && !m_mountPoint.isEmpty())
@@ -491,6 +607,7 @@ void FuseMount::unmount() {
         fuse_unmount(m_fuse);
         if (m_thread.joinable())
             m_thread.join();
+        std::lock_guard<std::mutex> ptrLock(m_fusePtrMutex);
         fuse_destroy(m_fuse);
         m_fuse = nullptr;
     } else if (m_thread.joinable()) {
@@ -498,7 +615,5 @@ void FuseMount::unmount() {
     }
 
     m_mounted.store(false);
-    m_kernelFuse.store(false);
-    m_ownsFuse.store(false);
     emit stateChanged();
 }

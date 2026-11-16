@@ -1,5 +1,6 @@
 #include <QDateTime>
 #include <QDir>
+#include <QElapsedTimer>
 #include <QFile>
 #include <QJSEngine>
 #include <QJsonArray>
@@ -7,6 +8,7 @@
 #include <QJsonObject>
 #include <QScopeGuard>
 #include <QTemporaryDir>
+#include <QThread>
 #include <QtTest>
 #include <cerrno>
 #include <cstdio>
@@ -653,6 +655,542 @@ private slots:
             struct stat st {};
             QCOMPARE(vfs->handleGetattr("/ProjectsRenamed/Testing", &st), 0);
             QCOMPARE(vfs->handleGetattr("/NotesRenamed.txt", &st), 0);
+        }
+    }
+
+    void staleWhileRevalidateReaddirIsNonBlockingAndPersistsListedDirs()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+
+        const QString fakeBinDir = dir.path() + "/bin";
+        QVERIFY(QDir().mkpath(fakeBinDir));
+        const QString marker = dir.path() + "/slow_docs";
+        const QString fakeRclone = fakeBinDir + "/rclone";
+        write(fakeRclone,
+              "#!/bin/sh\n"
+              "if [ \"$1\" = \"listremotes\" ]; then\n"
+              "  echo \"gdrive:\"\n"
+              "  exit 0\n"
+              "fi\n"
+              "if [ \"$1\" = \"lsjson\" ]; then\n"
+              "  for a in \"$@\"; do last=\"$a\"; done\n"
+              "  if [ \"$last\" = \"gdrive:Docs\" ] && [ -f '" + marker.toUtf8() + "' ]; then\n"
+              "    sleep 1\n"
+              "    echo '[{\"Path\":\"Intro.pdf\",\"Name\":\"Intro.pdf\",\"Size\":1024,\"IsDir\":false,\"ModTime\":\"2026-11-16T08:00:00Z\"},"
+              "{\"Path\":\"Updated.pdf\",\"Name\":\"Updated.pdf\",\"Size\":2048,\"IsDir\":false,\"ModTime\":\"2026-11-16T08:10:00Z\"}]'\n"
+              "    exit 0\n"
+              "  fi\n"
+              "  case \"$last\" in\n"
+              "    \"gdrive:\")\n"
+              "      echo '[{\"Path\":\"Docs\",\"Name\":\"Docs\",\"Size\":0,\"IsDir\":true,\"ModTime\":\"2026-11-16T08:00:00Z\"}]'\n"
+              "      ;;\n"
+              "    \"gdrive:Docs\")\n"
+              "      echo '[{\"Path\":\"Intro.pdf\",\"Name\":\"Intro.pdf\",\"Size\":1024,\"IsDir\":false,\"ModTime\":\"2026-11-16T08:00:00Z\"}]'\n"
+              "      ;;\n"
+              "    *) echo '[]' ;;\n"
+              "  esac\n"
+              "  exit 0\n"
+              "fi\n"
+              "exit 1\n");
+        QVERIFY(QFile::setPermissions(fakeRclone, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner));
+
+        const QByteArray oldPath = qgetenv("PATH");
+        const QByteArray oldSyncBlocking = qgetenv("WICKFS_SYNC_BLOCKING");
+        const QByteArray oldEnableFuse = qgetenv("WICKFS_ENABLE_FUSE");
+        const QByteArray oldDisableFuse = qgetenv("WICKFS_DISABLE_FUSE");
+        auto restoreEnv = qScopeGuard([&]() {
+            qputenv("PATH", oldPath);
+            if (oldSyncBlocking.isEmpty()) qunsetenv("WICKFS_SYNC_BLOCKING");
+            else qputenv("WICKFS_SYNC_BLOCKING", oldSyncBlocking);
+            if (oldEnableFuse.isEmpty()) qunsetenv("WICKFS_ENABLE_FUSE");
+            else qputenv("WICKFS_ENABLE_FUSE", oldEnableFuse);
+            if (oldDisableFuse.isEmpty()) qunsetenv("WICKFS_DISABLE_FUSE");
+            else qputenv("WICKFS_DISABLE_FUSE", oldDisableFuse);
+        });
+        qputenv("PATH", fakeBinDir.toUtf8() + ":" + oldPath);
+
+        const QString cfgPath = dir.path() + "/rclone.conf";
+        write(cfgPath, "[gdrive]\ntype = drive\ntoken = {\"access_token\":\"tok\"}\n");
+        const QString stateDir = dir.path() + "/state";
+        const QString mntDir = dir.path() + "/mnt";
+
+        // Step 1: Initial listing persists Docs in listedDirs & syncedDirTimestampsMs
+        {
+            qputenv("WICKFS_SYNC_BLOCKING", "1");
+            Backend b(stateDir, mntDir);
+            b.setRcloneConfigPath(cfgPath);
+            QVERIFY(b.connectRcloneRemote("gdrive"));
+            int err = 0;
+            const QStringList firstList = b.fuseMount()->handleReaddir("/Docs", &err);
+            QCOMPARE(err, 0);
+            QVERIFY(firstList.contains("Intro.pdf"));
+        }
+
+        // Backdate Docs timestamp in state.json by 20 minutes so it is stale (> 15 min TTL)
+        {
+            QFile sf(stateDir + "/state.json");
+            QVERIFY(sf.open(QIODevice::ReadOnly));
+            QJsonObject root = QJsonDocument::fromJson(sf.readAll()).object();
+            sf.close();
+            QVERIFY(root.value("listedDirs").toArray().contains(QStringLiteral("Docs")));
+            QJsonObject tsObj = root.value("syncedDirTimestampsMs").toObject();
+            tsObj.insert("Docs", static_cast<double>(QDateTime::currentMSecsSinceEpoch() - 20LL * 60LL * 1000LL));
+            root.insert("syncedDirTimestampsMs", tsObj);
+            QVERIFY(sf.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            sf.write(QJsonDocument(root).toJson(QJsonDocument::Compact));
+        }
+
+        // Step 2: Restart with async mode enabled and slow rclone; readdir must return cached entries immediately
+        write(marker, "1");
+        qunsetenv("WICKFS_SYNC_BLOCKING");
+        qputenv("WICKFS_ENABLE_FUSE", "1");
+        qputenv("WICKFS_DISABLE_FUSE", "1");
+
+        Backend b2(stateDir, mntDir);
+        b2.setRcloneConfigPath(cfgPath);
+        int err = 0;
+        QElapsedTimer timer;
+        timer.start();
+        const QList<VfsDirEntry> entries = b2.fuseMount()->handleReaddirEntries("/Docs", &err);
+        const qint64 elapsedMs = timer.elapsed();
+
+        QCOMPARE(err, 0);
+        QVERIFY2(elapsedMs < 200, qPrintable(QStringLiteral("Expected non-blocking readdir, took %1ms").arg(elapsedMs)));
+        QCOMPARE(entries.size(), 1);
+        QCOMPARE(entries.first().name, QString("Intro.pdf"));
+        QCOMPARE(entries.first().sizeBytes, 1024LL);
+        QCOMPARE(entries.first().isDir, false);
+        QCOMPARE(entries.first().isResident, false);
+
+        // Background refresh finishes and merges Updated.pdf
+        QTRY_COMPARE_WITH_TIMEOUT(b2.entryForPath("Docs/Updated.pdf").sizeBytes, 2048LL, 4000);
+    }
+
+    void asyncRootSyncPreservesDiscoveredDirsAndTimestamps()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+
+        const QString fakeBinDir = dir.path() + "/bin";
+        QVERIFY(QDir().mkpath(fakeBinDir));
+        const QString lsLog = dir.path() + "/ls.log";
+        const QString fakeRclone = fakeBinDir + "/rclone";
+        write(fakeRclone,
+              "#!/bin/sh\n"
+              "if [ \"$1\" = \"listremotes\" ]; then\n"
+              "  echo \"gdrive:\"\n"
+              "  exit 0\n"
+              "fi\n"
+              "if [ \"$1\" = \"lsjson\" ]; then\n"
+              "  echo \"$*\" >> '" + lsLog.toUtf8() + "'\n"
+              "  for a in \"$@\"; do last=\"$a\"; done\n"
+              "  case \"$last\" in\n"
+              "    \"gdrive:\")\n"
+              "      echo '[{\"Path\":\"Deep\",\"Name\":\"Deep\",\"Size\":0,\"IsDir\":true,\"ModTime\":\"2026-11-16T08:00:00Z\"}]'\n"
+              "      ;;\n"
+              "    \"gdrive:Deep\")\n"
+              "      echo '[{\"Path\":\"Sub\",\"Name\":\"Sub\",\"Size\":0,\"IsDir\":true,\"ModTime\":\"2026-11-16T08:00:00Z\"}]'\n"
+              "      ;;\n"
+              "    \"gdrive:Deep/Sub\")\n"
+              "      echo '[{\"Path\":\"Empty\",\"Name\":\"Empty\",\"Size\":0,\"IsDir\":true,\"ModTime\":\"2026-11-16T08:00:00Z\"},"
+              "{\"Path\":\"Note.txt\",\"Name\":\"Note.txt\",\"Size\":512,\"IsDir\":false,\"ModTime\":\"2026-11-16T08:00:00Z\"}]'\n"
+              "      ;;\n"
+              "    *) echo '[]' ;;\n"
+              "  esac\n"
+              "  exit 0\n"
+              "fi\n"
+              "exit 1\n");
+        QVERIFY(QFile::setPermissions(fakeRclone, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner));
+
+        const QByteArray oldPath = qgetenv("PATH");
+        const QByteArray oldSyncBlocking = qgetenv("WICKFS_SYNC_BLOCKING");
+        const QByteArray oldEnableFuse = qgetenv("WICKFS_ENABLE_FUSE");
+        const QByteArray oldDisableFuse = qgetenv("WICKFS_DISABLE_FUSE");
+        auto restoreEnv = qScopeGuard([&]() {
+            qputenv("PATH", oldPath);
+            if (oldSyncBlocking.isEmpty()) qunsetenv("WICKFS_SYNC_BLOCKING");
+            else qputenv("WICKFS_SYNC_BLOCKING", oldSyncBlocking);
+            if (oldEnableFuse.isEmpty()) qunsetenv("WICKFS_ENABLE_FUSE");
+            else qputenv("WICKFS_ENABLE_FUSE", oldEnableFuse);
+            if (oldDisableFuse.isEmpty()) qunsetenv("WICKFS_DISABLE_FUSE");
+            else qputenv("WICKFS_DISABLE_FUSE", oldDisableFuse);
+        });
+        qputenv("PATH", fakeBinDir.toUtf8() + ":" + oldPath);
+        qunsetenv("WICKFS_SYNC_BLOCKING");
+        qputenv("WICKFS_ENABLE_FUSE", "1");
+        qputenv("WICKFS_DISABLE_FUSE", "1");
+
+        const QString cfgPath = dir.path() + "/rclone.conf";
+        write(cfgPath, "[gdrive]\ntype = drive\ntoken = {\"access_token\":\"tok\"}\n");
+
+        Backend b(dir.path() + "/state", dir.path() + "/mnt");
+        b.setRcloneConfigPath(cfgPath);
+        QVERIFY(b.connectRcloneRemote("gdrive"));
+        QTRY_VERIFY_WITH_TIMEOUT(!b.syncing(), 4000);
+
+        // First open of Deep and Deep/Sub discovers Note.txt & Empty
+        int err = 0;
+        QCOMPARE(b.fuseMount()->handleReaddir("/Deep", &err), QStringList{"Sub"});
+        QCOMPARE(err, 0);
+        const QStringList subEntries = b.fuseMount()->handleReaddir("/Deep/Sub", &err);
+        QCOMPARE(err, 0);
+        QVERIFY(subEntries.contains("Note.txt"));
+        QVERIFY(subEntries.contains("Empty"));
+
+        // Async root sync must NOT wipe out Deep/Sub timestamp or trigger extra lsjson on subsequent readdir
+        b.syncNow();
+        QTRY_VERIFY_WITH_TIMEOUT(!b.syncing(), 4000);
+
+        QFile logF(lsLog);
+        QVERIFY(logF.open(QIODevice::ReadOnly));
+        const int countBefore = QString::fromUtf8(logF.readAll()).count("lsjson");
+        logF.close();
+
+        const QStringList subEntriesAfter = b.fuseMount()->handleReaddir("/Deep/Sub", &err);
+        QCOMPARE(err, 0);
+        QVERIFY(subEntriesAfter.contains("Note.txt"));
+
+        QVERIFY(logF.open(QIODevice::ReadOnly));
+        const int countAfter = QString::fromUtf8(logF.readAll()).count("lsjson");
+        QCOMPARE(countAfter, countBefore);
+    }
+
+    void unmountDoesNotWriteProjectionStubs()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString mntDir = dir.filePath("mnt");
+        Backend b(dir.filePath("state"), mntDir);
+        QVERIFY(b.mountDrive());
+        QVERIFY(b.mounted());
+        b.unmountDrive();
+
+        // Clear any pre-mount projection files and verify a second mount/unmount leaves dir clean
+        QDir(mntDir).removeRecursively();
+        QDir().mkpath(mntDir);
+        QVERIFY(b.mountDrive());
+        b.unmountDrive();
+        // Calling unmountDrive when unmounted does not write projection stubs
+        QDir(mntDir).removeRecursively();
+        QDir().mkpath(mntDir);
+        b.unmountDrive();
+        QCOMPARE(QDir(mntDir).entryList(QDir::NoDotAndDotDot | QDir::AllEntries).size(), 0);
+    }
+
+    void pluginModelParsesLargeStateWithoutTruncation()
+    {
+        QFile jsFile(":/plugin/Model.js");
+        QVERIFY(jsFile.open(QIODevice::ReadOnly));
+        QString code = QString::fromUtf8(jsFile.readAll());
+        code.replace(".pragma library", "");
+
+        QJSEngine engine;
+        QJSValue evalRes = engine.evaluate(code);
+        QVERIFY2(!evalRes.isError(), qPrintable(evalRes.toString()));
+
+        // Build >300 KB state.json with 2000 entries (exceeding old 256 KB & 64-entry limits)
+        QJsonArray entriesArr;
+        for (int i = 0; i < 2000; ++i) {
+            QJsonObject entry;
+            entry.insert("path", QStringLiteral("Folder_%1/Document_With_Long_Name_%2.pdf").arg(i % 20).arg(i));
+            entry.insert("name", QStringLiteral("Document_With_Long_Name_%1.pdf").arg(i));
+            entry.insert("folder", QStringLiteral("Folder_%1").arg(i % 20));
+            entry.insert("sizeBytes", 1048576);
+            entry.insert("state", i < 100 ? "cached" : "cloud");
+            entry.insert("pinned", i < 10);
+            entry.insert("accessCount", i < 10 ? 5 : 0);
+            entriesArr.append(entry);
+        }
+        QJsonObject payload;
+        payload.insert("maxCacheBytes", 250.0 * 1024.0 * 1024.0);
+        payload.insert("entries", entriesArr);
+        const QByteArray raw = QJsonDocument(payload).toJson(QJsonDocument::Compact);
+        QVERIFY(raw.size() > 262144);
+
+        QJSValue parseFn = engine.globalObject().property("parseStateJson");
+        QJSValue parsed = parseFn.call({QString::fromUtf8(raw)});
+        QCOMPARE(parsed.property("totalFiles").toInt(), 2000);
+        QCOMPARE(parsed.property("cachedFiles").toInt(), 100);
+        QCOMPARE(parsed.property("pinnedFiles").toInt(), 10);
+        QCOMPARE(parsed.property("cloudOnlyFiles").toInt(), 1900);
+        QCOMPARE(parsed.property("cachedBytes").toNumber(), 100.0 * 1048576.0);
+        QCOMPARE(parsed.property("files").property("length").toInt(), 6);
+    }
+
+    void concurrentStatAndReaddirDoNotBlockOnSlowHydration()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+
+        const QString fakeBinDir = dir.path() + "/bin";
+        QVERIFY(QDir().mkpath(fakeBinDir));
+        const QString fakeRclone = fakeBinDir + "/rclone";
+        write(fakeRclone,
+              "#!/bin/sh\n"
+              "if [ \"$1\" = \"listremotes\" ]; then echo \"gdrive:\"; exit 0; fi\n"
+              "if [ \"$1\" = \"lsjson\" ]; then\n"
+              "  echo '[{\"Path\":\"Slow.bin\",\"Name\":\"Slow.bin\",\"Size\":100,\"IsDir\":false,\"ModTime\":\"2026-11-16T08:00:00Z\"},"
+              "{\"Path\":\"Fast.txt\",\"Name\":\"Fast.txt\",\"Size\":50,\"IsDir\":false,\"ModTime\":\"2026-11-16T08:00:00Z\"}]'\n"
+              "  exit 0\n"
+              "fi\n"
+              "if [ \"$1\" = \"copyto\" ]; then\n"
+              "  sleep 1\n"
+              "  for a in \"$@\"; do dst=\"$a\"; done\n"
+              "  printf 'hydrated' > \"$dst\"\n"
+              "  exit 0\n"
+              "fi\n"
+              "exit 1\n");
+        QVERIFY(QFile::setPermissions(fakeRclone, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner));
+
+        const QByteArray oldPath = qgetenv("PATH");
+        const QByteArray oldSyncBlocking = qgetenv("WICKFS_SYNC_BLOCKING");
+        auto restoreEnv = qScopeGuard([&]() {
+            qputenv("PATH", oldPath);
+            if (oldSyncBlocking.isEmpty()) qunsetenv("WICKFS_SYNC_BLOCKING");
+            else qputenv("WICKFS_SYNC_BLOCKING", oldSyncBlocking);
+        });
+        qputenv("PATH", fakeBinDir.toUtf8() + ":" + oldPath);
+        qputenv("WICKFS_SYNC_BLOCKING", "1");
+
+        const QString cfgPath = dir.path() + "/rclone.conf";
+        write(cfgPath, "[gdrive]\ntype = drive\ntoken = {\"access_token\":\"tok\"}\n");
+
+        Backend b(dir.path() + "/state", dir.path() + "/mnt");
+        b.setRcloneConfigPath(cfgPath);
+        QVERIFY(b.connectRcloneRemote("gdrive"));
+
+        std::unique_ptr<QThread> hydrator(QThread::create([&b]() {
+            b.vfsOpenAndHydrate("Slow.bin", false);
+        }));
+        hydrator->start();
+        QTest::qWait(80);
+
+        QElapsedTimer timer;
+        timer.start();
+        struct stat st {};
+        QCOMPARE(b.fuseMount()->handleGetattr("/Fast.txt", &st), 0);
+        int err = 0;
+        const QList<VfsDirEntry> dirList = b.fuseMount()->handleReaddirEntries("/", &err);
+        const qint64 elapsedMs = timer.elapsed();
+
+        QCOMPARE(err, 0);
+        QCOMPARE(dirList.size(), 2);
+        QVERIFY2(elapsedMs < 200, qPrintable(QStringLiteral("stat/readdir blocked during hydration: %1ms").arg(elapsedMs)));
+
+        hydrator->wait();
+    }
+
+    void mkdirAndRmdirInVfs()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString stateDir = dir.filePath("state");
+        const QString mntDir = dir.filePath("mnt");
+
+        {
+            Backend b(stateDir, mntDir);
+            FuseMount *vfs = b.fuseMount();
+            QVERIFY(vfs != nullptr);
+
+            // Create top-level and nested directories (including spaces in name).
+            QCOMPARE(vfs->handleMkdir("/Projects", 0755), 0);
+            QCOMPARE(vfs->handleMkdir("/Projects/Module 15", 0755), 0);
+
+            struct stat st {};
+            QCOMPARE(vfs->handleGetattr("/Projects", &st), 0);
+            QVERIFY(S_ISDIR(st.st_mode));
+            QCOMPARE(vfs->handleGetattr("/Projects/Module 15", &st), 0);
+            QVERIFY(S_ISDIR(st.st_mode));
+
+            int err = 0;
+            const QStringList projChildren = vfs->handleReaddir("/Projects", &err);
+            QCOMPARE(err, 0);
+            QCOMPARE(projChildren, QStringList{"Module 15"});
+            const QStringList weekChildren = vfs->handleReaddir("/Projects/Module 15", &err);
+            QCOMPARE(err, 0);
+            QVERIFY(weekChildren.isEmpty());
+
+            // Create and write a file inside the newly created directory.
+            QString localPath;
+            QVERIFY(b.vfsCreateFile("Projects/Module 15/notes.txt", &localPath));
+            const QByteArray payload("Module 15 notes\n");
+            QCOMPARE(vfs->handleWriteFile("/Projects/Module 15/notes.txt", payload.constData(), payload.size(), 0),
+                     static_cast<int>(payload.size()));
+
+            // POSIX error cases for mkdir.
+            QCOMPARE(vfs->handleMkdir("/", 0755), -EEXIST);
+            QCOMPARE(vfs->handleMkdir("/Projects", 0755), -EEXIST);
+            QCOMPARE(vfs->handleMkdir("/Projects/Module 15/notes.txt", 0755), -EEXIST);
+            QCOMPARE(vfs->handleMkdir("/MissingParent/Child", 0755), -ENOENT);
+            QCOMPARE(vfs->handleMkdir("/Projects/Module 15/notes.txt/Sub", 0755), -ENOTDIR);
+
+            // POSIX error cases for rmdir.
+            QCOMPARE(vfs->handleRmdir("/"), -EBUSY);
+            QCOMPARE(vfs->handleRmdir("/NoSuchDir"), -ENOENT);
+            QCOMPARE(vfs->handleRmdir("/Projects/Module 15/notes.txt"), -ENOTDIR);
+            QCOMPARE(vfs->handleRmdir("/Projects"), -ENOTEMPTY);
+            QCOMPARE(vfs->handleRmdir("/Projects/Module 15"), -ENOTEMPTY);
+
+            // Unlink the file, then remove the empty nested directory, keep /Projects.
+            QCOMPARE(vfs->handleUnlink("/Projects/Module 15/notes.txt"), 0);
+            QCOMPARE(vfs->handleRmdir("/Projects/Module 15"), 0);
+            QCOMPARE(vfs->handleGetattr("/Projects/Module 15", &st), -ENOENT);
+            QVERIFY(vfs->handleReaddir("/Projects", &err).isEmpty());
+
+            // Create another persisted empty folder before restart.
+            QCOMPARE(vfs->handleMkdir("/Projects/Module 16", 0755), 0);
+        }
+
+        // Reload state from disk and verify directory creation/deletion persisted.
+        Backend bReloaded(stateDir, mntDir);
+        FuseMount *vfsReloaded = bReloaded.fuseMount();
+        struct stat st {};
+        QCOMPARE(vfsReloaded->handleGetattr("/Projects/Module 15", &st), -ENOENT);
+        QCOMPARE(vfsReloaded->handleGetattr("/Projects/Module 16", &st), 0);
+        QVERIFY(S_ISDIR(st.st_mode));
+    }
+
+    void mkdirAndRmdirInLocalFolderAndRcloneModes()
+    {
+        // 1. Local source folder mode propagates mkdir/rmdir to source folder.
+        {
+            QTemporaryDir dir;
+            QVERIFY(dir.isValid());
+            const QString remoteDir = dir.filePath("remote_cloud");
+            QVERIFY(QDir().mkpath(remoteDir + "/Courses"));
+            write(remoteDir + "/Courses/Syllabus.md", "syllabus\n");
+
+            Backend b(dir.filePath("state"), dir.filePath("mnt"));
+            QVERIFY(b.connectLocalSource(remoteDir));
+            FuseMount *vfs = b.fuseMount();
+            QVERIFY(vfs != nullptr);
+
+            QCOMPARE(vfs->handleMkdir("/Courses/Module 15", 0755), 0);
+            QVERIFY(QFileInfo(remoteDir + "/Courses/Module 15").isDir());
+
+            QCOMPARE(vfs->handleRmdir("/Courses"), -ENOTEMPTY);
+            QCOMPARE(vfs->handleRmdir("/Courses/Module 15"), 0);
+            QVERIFY(!QFileInfo::exists(remoteDir + "/Courses/Module 15"));
+        }
+
+        // 2. rclone mode invokes `rclone mkdir` and `rclone rmdir` (including from worker threads).
+        {
+            QTemporaryDir dir;
+            QVERIFY(dir.isValid());
+            const QString fakeBinDir = dir.path() + "/bin";
+            QVERIFY(QDir().mkpath(fakeBinDir));
+            const QString cmdLog = dir.path() + "/rclone_dir.log";
+            const QString module15Marker = dir.path() + "/remote_module15";
+            const QString fakeRclone = fakeBinDir + "/rclone";
+
+            write(fakeRclone,
+                  "#!/bin/sh\n"
+                  "if [ \"$1\" = \"listremotes\" ]; then\n"
+                  "  echo \"gdrive:\"\n"
+                  "  exit 0\n"
+                  "fi\n"
+                  "if [ \"$1\" = \"lsjson\" ]; then\n"
+                  "  for a in \"$@\"; do last=\"$a\"; done\n"
+                  "  case \"$last\" in\n"
+                  "    \"gdrive:\")\n"
+                  "      echo '[{\"Path\":\"Workspace\",\"Name\":\"Workspace\",\"Size\":0,\"IsDir\":true,\"ModTime\":\"2026-11-16T09:00:00Z\"}]'\n"
+                  "      ;;\n"
+                  "    \"gdrive:Workspace\")\n"
+                  "      echo '[{\"Path\":\"Sample Project 2026\",\"Name\":\"Sample Project 2026\",\"Size\":0,\"IsDir\":true,\"ModTime\":\"2026-11-16T09:00:00Z\"}]'\n"
+                  "      ;;\n"
+                  "    \"gdrive:Workspace/Sample Project 2026\")\n"
+                  "      if [ -f '" + module15Marker.toUtf8() + "' ]; then\n"
+                  "        echo '[{\"Path\":\"Module 15\",\"Name\":\"Module 15\",\"Size\":0,\"IsDir\":true,\"ModTime\":\"2026-11-16T09:00:00Z\"}]'\n"
+                  "      else\n"
+                  "        echo '[]'\n"
+                  "      fi\n"
+                  "      ;;\n"
+                  "    *) echo '[]' ;;\n"
+                  "  esac\n"
+                  "  exit 0\n"
+                  "fi\n"
+                  "if [ \"$1\" = \"mkdir\" ]; then\n"
+                  "  for a in \"$@\"; do last=\"$a\"; done\n"
+                  "  echo \"mkdir:$last\" >> '" + cmdLog.toUtf8() + "'\n"
+                  "  case \"$last\" in\n"
+                  "    *FailDir*) echo \"ERROR : simulated failure\" >&2; exit 1 ;;\n"
+                  "    *\"Module 15\") touch '" + module15Marker.toUtf8() + "' ;;\n"
+                  "  esac\n"
+                  "  exit 0\n"
+                  "fi\n"
+                  "if [ \"$1\" = \"rmdir\" ]; then\n"
+                  "  for a in \"$@\"; do last=\"$a\"; done\n"
+                  "  echo \"rmdir:$last\" >> '" + cmdLog.toUtf8() + "'\n"
+                  "  case \"$last\" in\n"
+                  "    *RemoteNonEmpty*) echo \"ERROR : directory not empty\" >&2; exit 1 ;;\n"
+                  "    *\"Module 15\") rm -f '" + module15Marker.toUtf8() + "' ;;\n"
+                  "  esac\n"
+                  "  exit 0\n"
+                  "fi\n"
+                  "exit 1\n");
+            QVERIFY(QFile::setPermissions(fakeRclone, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner));
+
+            const QByteArray oldPath = qgetenv("PATH");
+            const QByteArray oldSyncBlocking = qgetenv("WICKFS_SYNC_BLOCKING");
+            auto restoreEnv = qScopeGuard([&]() {
+                qputenv("PATH", oldPath);
+                if (oldSyncBlocking.isEmpty()) qunsetenv("WICKFS_SYNC_BLOCKING");
+                else qputenv("WICKFS_SYNC_BLOCKING", oldSyncBlocking);
+            });
+            qputenv("PATH", fakeBinDir.toUtf8() + ":" + oldPath);
+            qputenv("WICKFS_SYNC_BLOCKING", "1");
+
+            const QString cfgPath = dir.path() + "/rclone.conf";
+            write(cfgPath, "[gdrive]\ntype = drive\ntoken = {\"access_token\":\"tok\"}\n");
+
+            Backend b(dir.path() + "/state", dir.path() + "/mnt");
+            b.setRcloneConfigPath(cfgPath);
+            QVERIFY(b.connectRcloneRemote("gdrive"));
+            FuseMount *vfs = b.fuseMount();
+            QVERIFY(vfs != nullptr);
+
+            int err = 0;
+            QVERIFY(vfs->handleReaddir("/Workspace", &err).contains("Sample Project 2026"));
+            QCOMPARE(err, 0);
+
+            // Simulate FUSE worker thread calling mkdir with spaces in path.
+            int workerRc = -1;
+            std::unique_ptr<QThread> worker(QThread::create([&]() {
+                workerRc = vfs->handleMkdir("/Workspace/Sample Project 2026/Module 15", 0755);
+            }));
+            worker->start();
+            worker->wait();
+            QCOMPARE(workerRc, 0);
+
+            struct stat st {};
+            QCOMPARE(vfs->handleGetattr("/Workspace/Sample Project 2026/Module 15", &st), 0);
+            QVERIFY(S_ISDIR(st.st_mode));
+            QVERIFY(vfs->handleReaddir("/Workspace/Sample Project 2026", &err).contains("Module 15"));
+            QCOMPARE(err, 0);
+
+            // Root sync preserves the newly created nested folder.
+            b.syncNow();
+            QVERIFY(b.folders().contains("Workspace/Sample Project 2026/Module 15"));
+
+            // Failed rclone mkdir returns -EIO and does not register the directory.
+            QCOMPARE(vfs->handleMkdir("/Workspace/Sample Project 2026/FailDir", 0755), -EIO);
+            QCOMPARE(vfs->handleGetattr("/Workspace/Sample Project 2026/FailDir", &st), -ENOENT);
+
+            // Remote non-empty error maps to -ENOTEMPTY and keeps the folder.
+            QCOMPARE(vfs->handleMkdir("/Workspace/Sample Project 2026/RemoteNonEmpty", 0755), 0);
+            QCOMPARE(vfs->handleRmdir("/Workspace/Sample Project 2026/RemoteNonEmpty"), -ENOTEMPTY);
+            QCOMPARE(vfs->handleGetattr("/Workspace/Sample Project 2026/RemoteNonEmpty", &st), 0);
+
+            // Removing Module 15 runs rclone rmdir and removes it from VFS.
+            QCOMPARE(vfs->handleRmdir("/Workspace/Sample Project 2026/Module 15"), 0);
+            QCOMPARE(vfs->handleGetattr("/Workspace/Sample Project 2026/Module 15", &st), -ENOENT);
+
+            QFile logFile(cmdLog);
+            QVERIFY(logFile.open(QIODevice::ReadOnly));
+            const QString logText = QString::fromUtf8(logFile.readAll());
+            QVERIFY(logText.contains("mkdir:gdrive:Workspace/Sample Project 2026/Module 15"));
+            QVERIFY(logText.contains("rmdir:gdrive:Workspace/Sample Project 2026/Module 15"));
         }
     }
 
