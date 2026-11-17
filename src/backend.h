@@ -40,6 +40,7 @@ struct DriveFileEntry {
     qint64 lastAccessedSecs = 0; // Most recent access timestamp (epoch seconds)
     double hotScore = 0.0;   // 0..100 LFU+LRU retention score
     bool isFrequent = false; // True when accessCount >= frequentThreshold
+    bool dirty = false;      // True when local writes have not yet synced to cloud
 };
 
 class DriveFileModel : public QAbstractListModel {
@@ -227,7 +228,8 @@ public:
     QString activeSyncFile() const { return m_activeSyncFile; }
     double syncProgress() const { return m_syncProgress; }
     QString lastSyncedFormatted() const;
-    int pendingSyncCount() const { return m_pendingSyncCount; }
+    int pendingSyncCount() const;
+    int pendingUploadCount() const;
     int syncedFileCount() const;
     bool autoStartEnabled() const;
     QString autoStartSummary() const;
@@ -334,6 +336,7 @@ public slots:
     QList<VfsDirEntry> vfsReadDirEntries(const QString &relDirPath, bool *existsOut = nullptr,
                                          bool allowRemoteSync = true);
     QString vfsOpenAndHydrate(const QString &relPath, bool forWrite, QString *errorOut = nullptr);
+    void vfsBeginWrite(const QString &relPath);
     bool vfsCreateFile(const QString &relPath, QString *localCachePathOut);
     bool vfsWriteCompleted(const QString &relPath);
     bool vfsUnlinkFile(const QString &relPath);
@@ -383,7 +386,11 @@ private:
     bool fetchFromRcloneLocked(const DriveFileEntry &entry, const QString &destBlobPath, QString *errorOut) const;
     static bool fetchFromRclonePath(const QString &rcloneBin, const QString &remoteName,
                                     const QString &remotePath, const QString &relPath,
-                                    const QString &destBlobPath, QString *errorOut);
+                                    const QString &destBlobPath, QString *errorOut,
+                                    const QString &configPath = {});
+    bool flushPendingUploads(QString *errorOut = nullptr);
+    void schedulePendingUpload(int delayMs = 250);
+    void startAsyncPendingUpload();
     QByteArray synthesizePayloadForEntry(const DriveFileEntry &entry) const;
     void syncRemoteFolder(const QString &folder);
     void startAsyncRcloneSync(const QString &folderOnly = {});
@@ -426,14 +433,19 @@ private:
     QSet<QString> m_listedDirs;
     QSet<QString> m_dirRefreshInFlight;
     QString m_pendingFolderSync;
+    QSet<QString> m_pendingDeletes;
+    QHash<QString, int> m_openWriteCounts;
     mutable QHash<QString, int> m_vfsFileIdx;
     mutable QHash<QString, QStringList> m_vfsDirChildren;
     mutable QSet<QString> m_vfsDirs;
     std::atomic<bool> m_rcloneSyncInFlight{false};
+    std::atomic<bool> m_uploadInFlight{false};
+    bool m_uploadMorePending = false;
     mutable qint64 m_lastLoadedStateMtimeMs = 0;
     mutable qint64 m_lastLoadedStateSize = 0;
     QTimer m_stateWatchTimer;
     QTimer m_saveDebounceTimer;
+    QTimer m_uploadDebounceTimer;
 
     // Single-pass cached aggregate stats (protected by m_mutex)
     mutable bool m_statsDirty = true;

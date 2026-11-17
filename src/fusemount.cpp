@@ -164,6 +164,8 @@ int fuseOpenCb(const char *path, struct fuse_file_info *fi) {
     int fd = ::open(localPath.toUtf8().constData(), flags, 0644);
     if (fd < 0)
         return -errno;
+    if (forWrite)
+        m->backend()->vfsBeginWrite(rel);
     fi->fh = static_cast<uint64_t>(fd);
     return 0;
 }
@@ -181,6 +183,7 @@ int fuseCreateCb(const char *path, mode_t mode, struct fuse_file_info *fi) {
     int fd = ::open(localPath.toUtf8().constData(), O_CREAT | O_TRUNC | O_RDWR, mode ? mode : 0644);
     if (fd < 0)
         return -errno;
+    m->backend()->vfsBeginWrite(rel);
     fi->fh = static_cast<uint64_t>(fd);
     return 0;
 }
@@ -236,7 +239,7 @@ int fuseReleaseCb(const char *path, struct fuse_file_info *fi) {
         fi->fh = 0;
     }
     FuseMount *m = currentMount();
-    if (m && m->backend() && fi && ((fi->flags & O_ACCMODE) != O_RDONLY)) {
+    if (m && m->backend() && fi && (((fi->flags & O_ACCMODE) != O_RDONLY) || (fi->flags & O_CREAT))) {
         m->backend()->vfsWriteCompleted(normalizeRelPath(path));
     }
     return 0;

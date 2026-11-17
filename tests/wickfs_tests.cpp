@@ -1194,6 +1194,266 @@ private slots:
         }
     }
 
+    void localWritesAndDeletesSyncInLocalFolderAndRcloneModes()
+    {
+        // 1. Local source folder mode propagates writes, truncations, and unlinks.
+        {
+            QTemporaryDir dir;
+            QVERIFY(dir.isValid());
+            const QString remoteDir = dir.filePath("remote_cloud");
+            QVERIFY(QDir().mkpath(remoteDir + "/Courses"));
+            write(remoteDir + "/Courses/Syllabus.md", "initial long syllabus contents here\n");
+
+            Backend b(dir.filePath("state"), dir.filePath("mnt"));
+            QVERIFY(b.connectLocalSource(remoteDir));
+            FuseMount *vfs = b.fuseMount();
+            QVERIFY(vfs != nullptr);
+
+            const QByteArray newBody = "# Lecture Notes\nWeek 15\n";
+            QCOMPARE(vfs->handleWriteFile("/Courses/Notes.md", newBody.constData(),
+                                          static_cast<size_t>(newBody.size()), 0),
+                     newBody.size());
+            QCOMPARE(b.pendingUploadCount(), 0);
+            QFile remoteNotes(remoteDir + "/Courses/Notes.md");
+            QVERIFY(remoteNotes.open(QIODevice::ReadOnly));
+            QCOMPARE(remoteNotes.readAll(), newBody);
+
+            // Truncating/recreating with shorter payload updates remote and shrinks tracked sizeBytes.
+            const QByteArray shortBody = "short\n";
+            QCOMPARE(vfs->handleUnlink("/Courses/Syllabus.md"), 0);
+            QVERIFY(!QFileInfo::exists(remoteDir + "/Courses/Syllabus.md"));
+            QString notesBlob;
+            QVERIFY(b.vfsCreateFile("Courses/Notes.md", &notesBlob));
+            write(notesBlob, shortBody);
+            QVERIFY(b.vfsWriteCompleted("Courses/Notes.md"));
+            QCOMPARE(b.entryForPath("Courses/Notes.md").sizeBytes, static_cast<qint64>(shortBody.size()));
+            QFile remoteNotes2(remoteDir + "/Courses/Notes.md");
+            QVERIFY(remoteNotes2.open(QIODevice::ReadOnly));
+            QCOMPARE(remoteNotes2.readAll(), shortBody);
+        }
+
+        // 2. rclone mode uploads local creates/edits, deletes unlinks, and protects dirty files while offline.
+        {
+            QTemporaryDir dir;
+            QVERIFY(dir.isValid());
+            const QString fakeBinDir = dir.path() + "/bin";
+            const QString fakeRemoteDir = dir.path() + "/remote_gdrive";
+            QVERIFY(QDir().mkpath(fakeBinDir));
+            QVERIFY(QDir().mkpath(fakeRemoteDir + "/Workspace/Sample Project 2026"));
+
+            const QString offlineFlag = dir.path() + "/offline.flag";
+            const QString cmdLog = dir.path() + "/rclone_sync.log";
+            const QString fakeRclone = fakeBinDir + "/rclone";
+
+            write(fakeRclone,
+                  "#!/bin/sh\n"
+                  "REMOTE_ROOT='" + fakeRemoteDir.toUtf8() + "'\n"
+                  "OFFLINE_FLAG='" + offlineFlag.toUtf8() + "'\n"
+                  "CMD_LOG='" + cmdLog.toUtf8() + "'\n"
+                  "cmd=\"$1\"\n"
+                  "shift\n"
+                  "if [ \"$cmd\" = \"listremotes\" ]; then\n"
+                  "  echo \"gdrive:\"\n"
+                  "  exit 0\n"
+                  "fi\n"
+                  "if [ \"$cmd\" = \"lsjson\" ]; then\n"
+                  "  for a in \"$@\"; do last=\"$a\"; done\n"
+                  "  rel=\"${last#gdrive:}\"\n"
+                  "  target=\"$REMOTE_ROOT\"\n"
+                  "  [ -n \"$rel\" ] && target=\"$REMOTE_ROOT/$rel\"\n"
+                  "  if [ ! -d \"$target\" ]; then echo '[]'; exit 0; fi\n"
+                  "  python3 -c 'import json, os, sys; root = sys.argv[1]; out = []\n"
+                  "for name in sorted(os.listdir(root)):\n"
+                  "  p = os.path.join(root, name)\n"
+                  "  is_dir = os.path.isdir(p)\n"
+                  "  out.append({\"Path\": name, \"Name\": name, \"Size\": 0 if is_dir else os.path.getsize(p), \"IsDir\": is_dir, \"ModTime\": \"2026-11-16T09:00:00Z\"})\n"
+                  "print(json.dumps(out))' \"$target\"\n"
+                  "  exit 0\n"
+                  "fi\n"
+                  "if [ \"$cmd\" = \"copyto\" ]; then\n"
+                  "  args_count=$#\n"
+                  "  src=\"\"; dst=\"\"\n"
+                  "  for a in \"$@\"; do\n"
+                  "    prev=\"$dst\"; dst=\"$a\"\n"
+                  "  done\n"
+                  "  src=\"$prev\"\n"
+                  "  echo \"copyto:$src->$dst\" >> \"$CMD_LOG\"\n"
+                  "  if [ -f \"$OFFLINE_FLAG\" ]; then\n"
+                  "    echo \"ERROR : simulated offline\" >&2\n"
+                  "    exit 1\n"
+                  "  fi\n"
+                  "  case \"$dst\" in\n"
+                  "    gdrive:*)\n"
+                  "      rel=\"${dst#gdrive:}\"\n"
+                  "      mkdir -p \"$(dirname \"$REMOTE_ROOT/$rel\")\"\n"
+                  "      cp \"$src\" \"$REMOTE_ROOT/$rel\"\n"
+                  "      ;;\n"
+                  "    *)\n"
+                  "      rel=\"${src#gdrive:}\"\n"
+                  "      mkdir -p \"$(dirname \"$dst\")\"\n"
+                  "      cp \"$REMOTE_ROOT/$rel\" \"$dst\"\n"
+                  "      ;;\n"
+                  "  esac\n"
+                  "  exit 0\n"
+                  "fi\n"
+                  "if [ \"$cmd\" = \"deletefile\" ]; then\n"
+                  "  for a in \"$@\"; do last=\"$a\"; done\n"
+                  "  echo \"deletefile:$last\" >> \"$CMD_LOG\"\n"
+                  "  if [ -f \"$OFFLINE_FLAG\" ]; then\n"
+                  "    echo \"ERROR : simulated offline\" >&2\n"
+                  "    exit 1\n"
+                  "  fi\n"
+                  "  rel=\"${last#gdrive:}\"\n"
+                  "  if [ ! -f \"$REMOTE_ROOT/$rel\" ]; then\n"
+                  "    echo \"ERROR : file not found\" >&2\n"
+                  "    exit 3\n"
+                  "  fi\n"
+                  "  rm -f \"$REMOTE_ROOT/$rel\"\n"
+                  "  exit 0\n"
+                  "fi\n"
+                  "exit 1\n");
+            QVERIFY(QFile::setPermissions(fakeRclone, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner));
+
+            const QByteArray oldPath = qgetenv("PATH");
+            const QByteArray oldSyncBlocking = qgetenv("WICKFS_SYNC_BLOCKING");
+            auto restoreEnv = qScopeGuard([&]() {
+                qputenv("PATH", oldPath);
+                if (oldSyncBlocking.isEmpty()) qunsetenv("WICKFS_SYNC_BLOCKING");
+                else qputenv("WICKFS_SYNC_BLOCKING", oldSyncBlocking);
+            });
+            qputenv("PATH", fakeBinDir.toUtf8() + ":" + oldPath);
+            qputenv("WICKFS_SYNC_BLOCKING", "1");
+
+            const QString cfgPath = dir.path() + "/rclone.conf";
+            write(cfgPath, "[gdrive]\ntype = drive\ntoken = {\"access_token\":\"tok\"}\n");
+
+            const QString stateDir = dir.path() + "/state";
+            const QString mntDir = dir.path() + "/mnt";
+
+            {
+                Backend b(stateDir, mntDir);
+                b.setRcloneConfigPath(cfgPath);
+                QVERIFY(b.connectRcloneRemote("gdrive"));
+                FuseMount *vfs = b.fuseMount();
+                QVERIFY(vfs != nullptr);
+
+                // Online create & write uploads to Google Drive immediately.
+                const QByteArray draftBody = "Draft content v1\n";
+                QCOMPARE(vfs->handleWriteFile("/Workspace/Sample Project 2026/Draft.md",
+                                              draftBody.constData(),
+                                              static_cast<size_t>(draftBody.size()), 0),
+                         draftBody.size());
+                QCOMPARE(b.pendingUploadCount(), 0);
+                QCOMPARE(b.syncState(), QString("synced"));
+                QVERIFY(QFileInfo::exists(fakeRemoteDir + "/Workspace/Sample Project 2026/Draft.md"));
+
+                QFile remoteDraft(fakeRemoteDir + "/Workspace/Sample Project 2026/Draft.md");
+                QVERIFY(remoteDraft.open(QIODevice::ReadOnly));
+                QCOMPARE(remoteDraft.readAll(), draftBody);
+
+                // Simulate offline: create nested & root files while upload fails.
+                write(offlineFlag, "1");
+                const QByteArray offlineBody = "Unsynced offline body\n";
+                const QByteArray rootBody = "Root offline file\n";
+                QCOMPARE(vfs->handleWriteFile("/Workspace/Sample Project 2026/Offline.md",
+                                              offlineBody.constData(),
+                                              static_cast<size_t>(offlineBody.size()), 0),
+                         offlineBody.size());
+                QCOMPARE(vfs->handleWriteFile("/RootOffline.md",
+                                              rootBody.constData(),
+                                              static_cast<size_t>(rootBody.size()), 0),
+                         rootBody.size());
+                QCOMPARE(b.pendingUploadCount(), 2);
+                QCOMPARE(b.syncState(), QString("pending"));
+
+                // Dirty files must never be evicted by cache cleanup or budget enforcement,
+                // while clean cold files like Draft.md can be evicted.
+                QVERIFY(!b.evictFile("Workspace/Sample Project 2026/Offline.md"));
+                QCOMPARE(b.evictColdFiles(), 1);
+                QCOMPARE(b.entryForPath("Workspace/Sample Project 2026/Draft.md").state, QString("cloud"));
+                QCOMPARE(b.entryForPath("Workspace/Sample Project 2026/Offline.md").state, QString("cached"));
+                QCOMPARE(b.entryForPath("RootOffline.md").state, QString("cached"));
+                b.setMaxCacheBytesDirect(1);
+                QCOMPARE(b.enforceCacheBudget(), 0);
+                QVERIFY(QFileInfo::exists(b.localBlobPath("Workspace/Sample Project 2026/Offline.md")));
+                QVERIFY(QFileInfo::exists(b.localBlobPath("RootOffline.md")));
+
+                // Root sync while offline preserves both root and nested dirty entries.
+                b.syncNow();
+                QVERIFY(b.entryForPath("RootOffline.md").dirty);
+                QVERIFY(b.entryForPath("Workspace/Sample Project 2026/Offline.md").dirty);
+                QCOMPARE(b.pendingUploadCount(), 2);
+            }
+
+            // Simulate daemon restart while offline files are still pending, then come back online.
+            QFile::remove(offlineFlag);
+            {
+                Backend bReloaded(stateDir, mntDir);
+                bReloaded.setRcloneConfigPath(cfgPath);
+                QCOMPARE(bReloaded.pendingUploadCount(), 2);
+                QCOMPARE(bReloaded.syncState(), QString("pending"));
+
+                bReloaded.syncNow();
+                QCOMPARE(bReloaded.pendingUploadCount(), 0);
+                QCOMPARE(bReloaded.syncState(), QString("synced"));
+                QVERIFY(QFileInfo::exists(fakeRemoteDir + "/Workspace/Sample Project 2026/Offline.md"));
+                QVERIFY(QFileInfo::exists(fakeRemoteDir + "/RootOffline.md"));
+
+                // Offline unlink queues remote deletion, prevents resurrection on sync, and deletes when back online.
+                FuseMount *vfsReloaded = bReloaded.fuseMount();
+                QVERIFY(vfsReloaded != nullptr);
+                write(offlineFlag, "1");
+                QCOMPARE(vfsReloaded->handleUnlink("/Workspace/Sample Project 2026/Draft.md"), 0);
+                QCOMPARE(bReloaded.pendingUploadCount(), 1);
+                bReloaded.syncNow();
+                QCOMPARE(bReloaded.entryForPath("Workspace/Sample Project 2026/Draft.md").path, QString());
+
+                QFile::remove(offlineFlag);
+                bReloaded.syncNow();
+                QCOMPARE(bReloaded.pendingUploadCount(), 0);
+                QVERIFY(!QFileInfo::exists(fakeRemoteDir + "/Workspace/Sample Project 2026/Draft.md"));
+            }
+
+            QFile logFile(cmdLog);
+            QVERIFY(logFile.open(QIODevice::ReadOnly));
+            const QString logText = QString::fromUtf8(logFile.readAll());
+            QVERIFY(logText.contains("->gdrive:Workspace/Sample Project 2026/Draft.md"));
+            QVERIFY(logText.contains("->gdrive:Workspace/Sample Project 2026/Offline.md"));
+            QVERIFY(logText.contains("->gdrive:RootOffline.md"));
+            QVERIFY(logText.contains("deletefile:gdrive:Workspace/Sample Project 2026/Draft.md"));
+        }
+    }
+
+    void writeDeferralWaitsUntilOpenWritersClose()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString remoteDir = dir.filePath("remote_cloud");
+        QVERIFY(QDir().mkpath(remoteDir));
+
+        Backend b(dir.filePath("state"), dir.filePath("mnt"));
+        QVERIFY(b.connectLocalSource(remoteDir));
+
+        QString blobPath;
+        QVERIFY(b.vfsCreateFile("LiveWrite.txt", &blobPath));
+        b.vfsBeginWrite("LiveWrite.txt");
+        b.vfsBeginWrite("LiveWrite.txt");
+
+        write(blobPath, "first-half ");
+        // First writer closes while second writer is still active: must stay dirty and not publish partial file yet.
+        QVERIFY(b.vfsWriteCompleted("LiveWrite.txt"));
+        QVERIFY(b.entryForPath("LiveWrite.txt").dirty);
+        QVERIFY(!QFileInfo::exists(remoteDir + "/LiveWrite.txt"));
+
+        write(blobPath, "first-half second-half");
+        // Final writer closes: now it propagates to remote and clears dirty.
+        QVERIFY(b.vfsWriteCompleted("LiveWrite.txt"));
+        QVERIFY(!b.entryForPath("LiveWrite.txt").dirty);
+        QFile remoteFile(remoteDir + "/LiveWrite.txt");
+        QVERIFY(remoteFile.open(QIODevice::ReadOnly));
+        QCOMPARE(remoteFile.readAll(), QByteArray("first-half second-half"));
+    }
+
 private:
     static void write(const QString &path, const QByteArray &contents)
     {
