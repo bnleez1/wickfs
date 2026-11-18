@@ -7,6 +7,8 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QScopeGuard>
+#include <QTcpServer>
+#include <QTcpSocket>
 #include <QTemporaryDir>
 #include <QThread>
 #include <QtTest>
@@ -1452,6 +1454,228 @@ private slots:
         QFile remoteFile(remoteDir + "/LiveWrite.txt");
         QVERIFY(remoteFile.open(QIODevice::ReadOnly));
         QCOMPARE(remoteFile.readAll(), QByteArray("first-half second-half"));
+    }
+
+    void driveChangesPollRefreshesNestedFolderAndInvalidatesStaleBlob()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+
+        const QString fakeBinDir = dir.path() + "/bin";
+        QVERIFY(QDir().mkpath(fakeBinDir));
+        const QString remoteUpdatedFlag = dir.path() + "/remote_updated";
+        const QString fakeRclone = fakeBinDir + "/rclone";
+        write(fakeRclone,
+              "#!/bin/sh\n"
+              "if [ \"$1\" = \"listremotes\" ]; then\n"
+              "  echo \"gdrive:\"\n"
+              "  exit 0\n"
+              "fi\n"
+              "if [ \"$1\" = \"lsjson\" ]; then\n"
+              "  for a in \"$@\"; do last=\"$a\"; done\n"
+              "  if [ \"$last\" = \"gdrive:Docs\" ] && [ -f '" + remoteUpdatedFlag.toUtf8() + "' ]; then\n"
+              "    echo '[{\"Path\":\"Intro.pdf\",\"Name\":\"Intro.pdf\",\"Size\":4096,\"IsDir\":false,\"ModTime\":\"2026-11-18T12:05:00Z\"},"
+              "{\"Path\":\"RemoteNote.md\",\"Name\":\"RemoteNote.md\",\"Size\":512,\"IsDir\":false,\"ModTime\":\"2026-11-18T12:05:00Z\"}]'\n"
+              "    exit 0\n"
+              "  fi\n"
+              "  case \"$last\" in\n"
+              "    \"gdrive:\")\n"
+              "      echo '[{\"Path\":\"Docs\",\"Name\":\"Docs\",\"Size\":0,\"IsDir\":true,\"ModTime\":\"2026-11-18T12:00:00Z\"}]'\n"
+              "      ;;\n"
+              "    \"gdrive:Docs\")\n"
+              "      echo '[{\"Path\":\"Intro.pdf\",\"Name\":\"Intro.pdf\",\"Size\":1024,\"IsDir\":false,\"ModTime\":\"2026-11-18T12:00:00Z\"}]'\n"
+              "      ;;\n"
+              "    *) echo '[]' ;;\n"
+              "  esac\n"
+              "  exit 0\n"
+              "fi\n"
+              "if [ \"$1\" = \"copyto\" ]; then\n"
+              "  dst=\"\"; for a in \"$@\"; do dst=\"$a\"; done\n"
+              "  printf 'v1-cached-bytes' > \"$dst\"\n"
+              "  exit 0\n"
+              "fi\n"
+              "exit 1\n");
+        QVERIFY(QFile::setPermissions(fakeRclone, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner));
+
+        bool deliverRemoteChange = false;
+        QTcpServer mockApi;
+        QVERIFY(mockApi.listen(QHostAddress::LocalHost, 0));
+        QObject::connect(&mockApi, &QTcpServer::newConnection, &mockApi, [&]() {
+            while (QTcpSocket *sock = mockApi.nextPendingConnection()) {
+                QObject::connect(sock, &QTcpSocket::readyRead, sock, [sock, &deliverRemoteChange]() {
+                    const QByteArray req = sock->readAll();
+                    const int sp1 = req.indexOf(' ');
+                    const int sp2 = req.indexOf(' ', sp1 + 1);
+                    const QByteArray target = (sp1 > 0 && sp2 > sp1) ? req.mid(sp1 + 1, sp2 - sp1 - 1) : QByteArray("/");
+
+                    QByteArray jsonBody = "{}";
+                    if (target.startsWith("/changes/startPageToken")) {
+                        jsonBody = R"({"startPageToken":"100"})";
+                    } else if (target.startsWith("/changes?")) {
+                        if (deliverRemoteChange) {
+                            jsonBody = R"({"newStartPageToken":"101","changes":[{"fileId":"f_new","removed":false,"file":{"id":"f_new","name":"RemoteNote.md","mimeType":"text/markdown","parents":["dir_docs"]}}]})";
+                        } else {
+                            jsonBody = R"({"newStartPageToken":"100","changes":[]})";
+                        }
+                    } else if (target.startsWith("/files/root")) {
+                        jsonBody = R"({"id":"dir_root"})";
+                    } else if (target.startsWith("/files/dir_docs")) {
+                        jsonBody = R"({"id":"dir_docs","name":"Docs","parents":["dir_root"]})";
+                    }
+
+                    const QByteArray httpResp =
+                        "HTTP/1.1 200 OK\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Connection: close\r\n"
+                        "Content-Length: " + QByteArray::number(jsonBody.size()) + "\r\n\r\n" + jsonBody;
+                    sock->write(httpResp);
+                    sock->disconnectFromHost();
+                });
+                QObject::connect(sock, &QTcpSocket::disconnected, sock, &QObject::deleteLater);
+            }
+        });
+
+        const QByteArray oldPath = qgetenv("PATH");
+        const QByteArray oldSyncBlocking = qgetenv("WICKFS_SYNC_BLOCKING");
+        const QByteArray oldEnableFuse = qgetenv("WICKFS_ENABLE_FUSE");
+        const QByteArray oldDisableFuse = qgetenv("WICKFS_DISABLE_FUSE");
+        const QByteArray oldApiBase = qgetenv("WICKFS_DRIVE_API_BASE");
+        auto restoreEnv = qScopeGuard([&]() {
+            qputenv("PATH", oldPath);
+            if (oldSyncBlocking.isEmpty()) qunsetenv("WICKFS_SYNC_BLOCKING");
+            else qputenv("WICKFS_SYNC_BLOCKING", oldSyncBlocking);
+            if (oldEnableFuse.isEmpty()) qunsetenv("WICKFS_ENABLE_FUSE");
+            else qputenv("WICKFS_ENABLE_FUSE", oldEnableFuse);
+            if (oldDisableFuse.isEmpty()) qunsetenv("WICKFS_DISABLE_FUSE");
+            else qputenv("WICKFS_DISABLE_FUSE", oldDisableFuse);
+            if (oldApiBase.isEmpty()) qunsetenv("WICKFS_DRIVE_API_BASE");
+            else qputenv("WICKFS_DRIVE_API_BASE", oldApiBase);
+        });
+        qputenv("PATH", fakeBinDir.toUtf8() + ":" + oldPath);
+        qunsetenv("WICKFS_SYNC_BLOCKING");
+        qputenv("WICKFS_ENABLE_FUSE", "1");
+        qputenv("WICKFS_DISABLE_FUSE", "1");
+        qputenv("WICKFS_DRIVE_API_BASE", QStringLiteral("http://127.0.0.1:%1").arg(mockApi.serverPort()).toUtf8());
+
+        const QString cfgPath = dir.path() + "/rclone.conf";
+        const QString futureExp = QDateTime::currentDateTimeUtc().addSecs(3600).toString(Qt::ISODate);
+        write(cfgPath, QStringLiteral("[gdrive]\ntype = drive\ntoken = {\"access_token\":\"tok\",\"expiry\":\"%1\"}\n").arg(futureExp).toUtf8());
+
+        Backend b(dir.path() + "/state", dir.path() + "/mnt");
+        b.setRcloneConfigPath(cfgPath);
+        QVERIFY(b.connectRcloneRemote("gdrive"));
+        QTRY_VERIFY_WITH_TIMEOUT(!b.syncing(), 4000);
+
+        int err = 0;
+        const QStringList initialDocs = b.fuseMount()->handleReaddir("/Docs", &err);
+        QCOMPARE(err, 0);
+        QCOMPARE(initialDocs, QStringList{"Intro.pdf"});
+
+        // Cache Intro.pdf locally so we also verify stale blob invalidation when remote size/mtime updates
+        QVERIFY(b.accessFile("Docs/Intro.pdf"));
+        QCOMPARE(b.entryForPath("Docs/Intro.pdf").state, QStringLiteral("cached"));
+        QVERIFY(QFileInfo::exists(b.localBlobPath("Docs/Intro.pdf")));
+
+        // First poll establishes startPageToken = 100
+        b.pollRemoteChanges();
+        QTest::qWait(150);
+
+        // Remote changes happen in Google Drive inside Docs
+        write(remoteUpdatedFlag, "1");
+        deliverRemoteChange = true;
+
+        b.pollRemoteChanges();
+        QTRY_COMPARE_WITH_TIMEOUT(b.entryForPath("Docs/RemoteNote.md").sizeBytes, 512LL, 4000);
+        QCOMPARE(b.entryForPath("Docs/Intro.pdf").sizeBytes, 4096LL);
+        QCOMPARE(b.entryForPath("Docs/Intro.pdf").state, QStringLiteral("cloud"));
+        QVERIFY(!QFileInfo::exists(b.localBlobPath("Docs/Intro.pdf")));
+    }
+
+    void staleRootReaddirRefreshesAsynchronously()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+
+        const QString fakeBinDir = dir.path() + "/bin";
+        QVERIFY(QDir().mkpath(fakeBinDir));
+        const QString updatedRootFlag = dir.path() + "/root_updated";
+        const QString fakeRclone = fakeBinDir + "/rclone";
+        write(fakeRclone,
+              "#!/bin/sh\n"
+              "if [ \"$1\" = \"listremotes\" ]; then\n"
+              "  echo \"gdrive:\"\n"
+              "  exit 0\n"
+              "fi\n"
+              "if [ \"$1\" = \"lsjson\" ]; then\n"
+              "  if [ -f '" + updatedRootFlag.toUtf8() + "' ]; then\n"
+              "    sleep 1\n"
+              "    echo '[{\"Path\":\"Initial.txt\",\"Name\":\"Initial.txt\",\"Size\":100,\"IsDir\":false,\"ModTime\":\"2026-11-18T12:00:00Z\"},"
+              "{\"Path\":\"AddedInRoot.txt\",\"Name\":\"AddedInRoot.txt\",\"Size\":256,\"IsDir\":false,\"ModTime\":\"2026-11-18T12:05:00Z\"}]'\n"
+              "    exit 0\n"
+              "  fi\n"
+              "  echo '[{\"Path\":\"Initial.txt\",\"Name\":\"Initial.txt\",\"Size\":100,\"IsDir\":false,\"ModTime\":\"2026-11-18T12:00:00Z\"}]'\n"
+              "  exit 0\n"
+              "fi\n"
+              "exit 1\n");
+        QVERIFY(QFile::setPermissions(fakeRclone, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner));
+
+        const QByteArray oldPath = qgetenv("PATH");
+        const QByteArray oldSyncBlocking = qgetenv("WICKFS_SYNC_BLOCKING");
+        const QByteArray oldEnableFuse = qgetenv("WICKFS_ENABLE_FUSE");
+        const QByteArray oldDisableFuse = qgetenv("WICKFS_DISABLE_FUSE");
+        auto restoreEnv = qScopeGuard([&]() {
+            qputenv("PATH", oldPath);
+            if (oldSyncBlocking.isEmpty()) qunsetenv("WICKFS_SYNC_BLOCKING");
+            else qputenv("WICKFS_SYNC_BLOCKING", oldSyncBlocking);
+            if (oldEnableFuse.isEmpty()) qunsetenv("WICKFS_ENABLE_FUSE");
+            else qputenv("WICKFS_ENABLE_FUSE", oldEnableFuse);
+            if (oldDisableFuse.isEmpty()) qunsetenv("WICKFS_DISABLE_FUSE");
+            else qputenv("WICKFS_DISABLE_FUSE", oldDisableFuse);
+        });
+        qputenv("PATH", fakeBinDir.toUtf8() + ":" + oldPath);
+
+        const QString cfgPath = dir.path() + "/rclone.conf";
+        write(cfgPath, "[gdrive]\ntype = drive\ntoken = {\"access_token\":\"tok\"}\n");
+        const QString stateDir = dir.path() + "/state";
+        const QString mntDir = dir.path() + "/mnt";
+
+        {
+            qputenv("WICKFS_SYNC_BLOCKING", "1");
+            Backend b(stateDir, mntDir);
+            b.setRcloneConfigPath(cfgPath);
+            QVERIFY(b.connectRcloneRemote("gdrive"));
+        }
+
+        // Backdate root timestamp by 2 minutes (> 60s TTL)
+        {
+            QFile sf(stateDir + "/state.json");
+            QVERIFY(sf.open(QIODevice::ReadOnly));
+            QJsonObject root = QJsonDocument::fromJson(sf.readAll()).object();
+            sf.close();
+            QJsonObject tsObj = root.value("syncedDirTimestampsMs").toObject();
+            tsObj.insert("", static_cast<double>(QDateTime::currentMSecsSinceEpoch() - 2LL * 60LL * 1000LL));
+            root.insert("syncedDirTimestampsMs", tsObj);
+            QVERIFY(sf.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            sf.write(QJsonDocument(root).toJson(QJsonDocument::Compact));
+        }
+
+        write(updatedRootFlag, "1");
+        qunsetenv("WICKFS_SYNC_BLOCKING");
+        qputenv("WICKFS_ENABLE_FUSE", "1");
+        qputenv("WICKFS_DISABLE_FUSE", "1");
+
+        Backend b2(stateDir, mntDir);
+        b2.setRcloneConfigPath(cfgPath);
+        int err = 0;
+        QElapsedTimer timer;
+        timer.start();
+        const QList<VfsDirEntry> entries = b2.fuseMount()->handleReaddirEntries("/", &err);
+        QCOMPARE(err, 0);
+        QVERIFY(timer.elapsed() < 200);
+        QCOMPARE(entries.size(), 1);
+        QCOMPARE(entries.first().name, QString("Initial.txt"));
+
+        QTRY_COMPARE_WITH_TIMEOUT(b2.entryForPath("AddedInRoot.txt").sizeBytes, 256LL, 4000);
     }
 
 private:

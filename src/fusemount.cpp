@@ -311,9 +311,11 @@ int fuseStatfsCb(const char *, struct statvfs *stbuf) {
 
 void *fuseInitCb(struct fuse_conn_info *, struct fuse_config *cfg) {
     if (cfg) {
-        cfg->entry_timeout = 60.0;
-        cfg->attr_timeout = 60.0;
-        cfg->negative_timeout = 15.0;
+        // Keep kernel metadata caches short so remote Drive updates appear quickly;
+        // getattr/lookup in Backend are pure in-memory hash checks.
+        cfg->entry_timeout = 2.0;
+        cfg->attr_timeout = 2.0;
+        cfg->negative_timeout = 1.0;
         cfg->auto_cache = 1;
         cfg->no_rofd_flush = 1;
     }

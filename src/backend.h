@@ -2,6 +2,7 @@
 
 #include <QAbstractListModel>
 #include <QByteArray>
+#include <QDateTime>
 #include <QHash>
 #include <QList>
 #include <QObject>
@@ -309,6 +310,7 @@ public slots:
     Q_INVOKABLE void unmountDrive();
 
     Q_INVOKABLE void syncNow();
+    Q_INVOKABLE void pollRemoteChanges();
     Q_INVOKABLE bool connectRcloneRemote(const QString &remoteName, const QString &remotePath = {});
     Q_INVOKABLE bool connectLocalSource(const QString &folderPath);
     Q_INVOKABLE void pickLocalSourceFolder();
@@ -395,6 +397,7 @@ private:
     void syncRemoteFolder(const QString &folder);
     void startAsyncRcloneSync(const QString &folderOnly = {});
     void scheduleAsyncDirRefresh(const QString &relDirPath);
+    void applyRcloneEntryMetadataLocked(DriveFileEntry &e, const QJsonObject &obj, const QString &relPath) const;
     void mergeRcloneRootJsonLocked(const QByteArray &rootJson);
     void mergeRcloneFolderJsonLocked(const QString &baseFolder, const QByteArray &folderJson,
                                      bool pruneDirectChildren = false);
@@ -439,11 +442,18 @@ private:
     mutable QHash<QString, QStringList> m_vfsDirChildren;
     mutable QSet<QString> m_vfsDirs;
     std::atomic<bool> m_rcloneSyncInFlight{false};
+    std::atomic<bool> m_changePollInFlight{false};
     std::atomic<bool> m_uploadInFlight{false};
     bool m_uploadMorePending = false;
+    QString m_driveChangePageToken;
+    QString m_driveRootFolderId;
+    QHash<QString, QString> m_driveFolderIdToPath;
+    QString m_cachedAccessToken;
+    QDateTime m_cachedAccessTokenExpiry;
     mutable qint64 m_lastLoadedStateMtimeMs = 0;
     mutable qint64 m_lastLoadedStateSize = 0;
     QTimer m_stateWatchTimer;
+    QTimer m_changePollTimer;
     QTimer m_saveDebounceTimer;
     QTimer m_uploadDebounceTimer;
 

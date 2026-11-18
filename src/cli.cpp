@@ -21,8 +21,8 @@ namespace {
 
 int s_sigFd[2] = {-1, -1};
 
-void handleTermSignal(int) {
-    char b = 1;
+void handleDaemonSignal(int sig) {
+    char b = (sig == SIGUSR1) ? 2 : 1;
     if (s_sigFd[0] >= 0) {
         const ssize_t ignored = ::write(s_sigFd[0], &b, sizeof(b));
         (void)ignored;
@@ -619,9 +619,9 @@ int runCli(int argc, char *argv[]) {
             return 0;
         }
 
-        // Periodic background sync every 15 minutes
+        // Periodic fallback root sync every 5 minutes (Drive changes poll runs every 30s)
         QTimer syncTimer;
-        syncTimer.setInterval(15 * 60 * 1000);
+        syncTimer.setInterval(5 * 60 * 1000);
         QObject::connect(&syncTimer, &QTimer::timeout, &backend, [&backend]() {
             if (!backend.mounted())
                 backend.mountDrive();
@@ -650,14 +650,23 @@ int runCli(int argc, char *argv[]) {
 
         QSocketNotifier *sigNotifier = nullptr;
         if (::socketpair(AF_UNIX, SOCK_STREAM, 0, s_sigFd) == 0) {
-            std::signal(SIGTERM, handleTermSignal);
-            std::signal(SIGINT, handleTermSignal);
+            std::signal(SIGTERM, handleDaemonSignal);
+            std::signal(SIGINT, handleDaemonSignal);
+            std::signal(SIGUSR1, handleDaemonSignal);
             sigNotifier = new QSocketNotifier(s_sigFd[1], QSocketNotifier::Read, &app);
-            QObject::connect(sigNotifier, &QSocketNotifier::activated, &app, [&app, sigNotifier]() {
-                sigNotifier->setEnabled(false);
+            QObject::connect(sigNotifier, &QSocketNotifier::activated, &app, [&app, &backend, sigNotifier]() {
                 char tmp = 0;
-                const ssize_t ignored = ::read(s_sigFd[1], &tmp, sizeof(tmp));
-                (void)ignored;
+                const ssize_t n = ::read(s_sigFd[1], &tmp, sizeof(tmp));
+                if (n <= 0)
+                    return;
+                if (tmp == 2) {
+                    if (!backend.mounted())
+                        backend.mountDrive();
+                    backend.pollRemoteChanges();
+                    backend.syncNow();
+                    return;
+                }
+                sigNotifier->setEnabled(false);
                 app.quit();
             });
         }
