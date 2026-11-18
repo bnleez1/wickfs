@@ -311,6 +311,7 @@ public slots:
 
     Q_INVOKABLE void syncNow();
     Q_INVOKABLE void pollRemoteChanges();
+    Q_INVOKABLE void refreshRecentDirs();
     Q_INVOKABLE bool connectRcloneRemote(const QString &remoteName, const QString &remotePath = {});
     Q_INVOKABLE bool connectLocalSource(const QString &folderPath);
     Q_INVOKABLE void pickLocalSourceFolder();
@@ -434,6 +435,7 @@ private:
     QStringList m_remoteFolders;
     QHash<QString, qint64> m_syncedDirTimestampsMs;
     QSet<QString> m_listedDirs;
+    QStringList m_recentDirs;
     QSet<QString> m_dirRefreshInFlight;
     QString m_pendingFolderSync;
     QSet<QString> m_pendingDeletes;

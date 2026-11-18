@@ -663,6 +663,7 @@ int runCli(int argc, char *argv[]) {
                     if (!backend.mounted())
                         backend.mountDrive();
                     backend.pollRemoteChanges();
+                    backend.refreshRecentDirs();
                     backend.syncNow();
                     return;
                 }

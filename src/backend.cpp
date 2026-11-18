@@ -616,7 +616,8 @@ bool Backend::fetchFromRclonePath(const QString &rcloneBin, const QString &remot
     QStringList args = {QStringLiteral("copyto")};
     if (!configPath.isEmpty())
         args << QStringLiteral("--config") << configPath;
-    args << QStringLiteral("--contimeout=5s")
+    args << QStringLiteral("--drive-export-formats=docx,xlsx,pptx,svg,png,jpg,pdf,txt")
+         << QStringLiteral("--contimeout=5s")
          << QStringLiteral("--timeout=20s")
          << QStringLiteral("--retries=1")
          << remoteSpec << partPath;
@@ -2033,7 +2034,8 @@ bool runRcloneLsjson(const QString &rcloneBin, const QString &spec, int maxDepth
         args << "--files-only";
     if (!configPath.isEmpty())
         args << "--config" << configPath;
-    args << "--contimeout=5s" << QStringLiteral("--timeout=%1s").arg(qMax(1, timeoutMs / 1000))
+    args << QStringLiteral("--drive-export-formats=docx,xlsx,pptx,svg,png,jpg,pdf,txt")
+         << "--contimeout=5s" << QStringLiteral("--timeout=%1s").arg(qMax(1, timeoutMs / 1000))
          << "--retries=1" << spec;
 
     QProcess proc;
@@ -3068,6 +3070,25 @@ void Backend::pollRemoteChanges() {
     t->start();
 }
 
+void Backend::refreshRecentDirs() {
+    QStringList dirs;
+    {
+        QMutexLocker locker(&m_mutex);
+        if (m_sourceMode != QLatin1String("rclone") || !m_rcloneAvailable || !m_availableRemotes.contains(m_remoteName))
+            return;
+        dirs = m_recentDirs;
+        for (const QString &d : dirs)
+            m_syncedDirTimestampsMs.insert(d, 0);
+    }
+
+    for (const QString &d : dirs) {
+        if (shouldUseAsyncRcloneSync())
+            scheduleAsyncDirRefresh(d);
+        else
+            syncRemoteFolder(d);
+    }
+}
+
 void Backend::syncRemoteFolder(const QString &folder) {
     if (folder.isEmpty() || folder == QLatin1String("Root"))
         return;
@@ -3783,6 +3804,12 @@ QList<VfsDirEntry> Backend::vfsReadDirEntries(const QString &relDirPath, bool *e
         if (allowRemoteSync && m_vfsDirs.contains(relDirPath)
             && m_sourceMode == QLatin1String("rclone") && m_rcloneAvailable
             && !m_remoteName.isEmpty() && m_availableRemotes.contains(m_remoteName)) {
+            if (!relDirPath.isEmpty()) {
+                m_recentDirs.removeAll(relDirPath);
+                m_recentDirs.prepend(relDirPath);
+                while (m_recentDirs.size() > 6)
+                    m_recentDirs.removeLast();
+            }
             const bool alreadyListed = m_listedDirs.contains(relDirPath);
             const qint64 lastSyncedMs = m_syncedDirTimestampsMs.value(relDirPath, 0);
             const bool stale = (nowMs - lastSyncedMs >= kDirSyncTtlMs);

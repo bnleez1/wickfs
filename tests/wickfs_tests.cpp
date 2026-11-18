@@ -1678,6 +1678,89 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(b2.entryForPath("AddedInRoot.txt").sizeBytes, 256LL, 4000);
     }
 
+    void refreshRecentDirsIncludesGoogleImageExportFormats()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+
+        const QString fakeBinDir = dir.path() + "/bin";
+        QVERIFY(QDir().mkpath(fakeBinDir));
+        const QString remoteAdded = dir.path() + "/added_img";
+        const QString argLog = dir.path() + "/args.log";
+        const QString fakeRclone = fakeBinDir + "/rclone";
+        write(fakeRclone,
+              "#!/bin/sh\n"
+              "echo \"$*\" >> '" + argLog.toUtf8() + "'\n"
+              "if [ \"$1\" = \"listremotes\" ]; then\n"
+              "  echo \"gdrive:\"\n"
+              "  exit 0\n"
+              "fi\n"
+              "if [ \"$1\" = \"lsjson\" ]; then\n"
+              "  for a in \"$@\"; do last=\"$a\"; done\n"
+              "  if [ \"$last\" = \"gdrive:Week15\" ] && [ -f '" + remoteAdded.toUtf8() + "' ]; then\n"
+              "    echo '[{\"Path\":\"Test image.png\",\"Name\":\"Test image.png\",\"Size\":-1,\"IsDir\":false,\"ModTime\":\"2026-11-18T12:20:00Z\"}]'\n"
+              "    exit 0\n"
+              "  fi\n"
+              "  case \"$last\" in\n"
+              "    \"gdrive:\")\n"
+              "      echo '[{\"Path\":\"Week15\",\"Name\":\"Week15\",\"Size\":0,\"IsDir\":true,\"ModTime\":\"2026-11-18T12:00:00Z\"}]'\n"
+              "      ;;\n"
+              "    \"gdrive:Week15\")\n"
+              "      echo '[]'\n"
+              "      ;;\n"
+              "    *) echo '[]' ;;\n"
+              "  esac\n"
+              "  exit 0\n"
+              "fi\n"
+              "if [ \"$1\" = \"copyto\" ]; then\n"
+              "  for a in \"$@\"; do dst=\"$a\"; done\n"
+              "  printf 'pngbytes' > \"$dst\"\n"
+              "  exit 0\n"
+              "fi\n"
+              "exit 1\n");
+        QVERIFY(QFile::setPermissions(fakeRclone, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner));
+
+        const QByteArray oldPath = qgetenv("PATH");
+        const QByteArray oldSyncBlocking = qgetenv("WICKFS_SYNC_BLOCKING");
+        const QByteArray oldEnableFuse = qgetenv("WICKFS_ENABLE_FUSE");
+        const QByteArray oldDisableFuse = qgetenv("WICKFS_DISABLE_FUSE");
+        auto restoreEnv = qScopeGuard([&]() {
+            qputenv("PATH", oldPath);
+            if (oldSyncBlocking.isEmpty()) qunsetenv("WICKFS_SYNC_BLOCKING");
+            else qputenv("WICKFS_SYNC_BLOCKING", oldSyncBlocking);
+            if (oldEnableFuse.isEmpty()) qunsetenv("WICKFS_ENABLE_FUSE");
+            else qputenv("WICKFS_ENABLE_FUSE", oldEnableFuse);
+            if (oldDisableFuse.isEmpty()) qunsetenv("WICKFS_DISABLE_FUSE");
+            else qputenv("WICKFS_DISABLE_FUSE", oldDisableFuse);
+        });
+        qputenv("PATH", fakeBinDir.toUtf8() + ":" + oldPath);
+        qunsetenv("WICKFS_SYNC_BLOCKING");
+        qputenv("WICKFS_ENABLE_FUSE", "1");
+        qputenv("WICKFS_DISABLE_FUSE", "1");
+
+        const QString cfgPath = dir.path() + "/rclone.conf";
+        write(cfgPath, "[gdrive]\ntype = drive\ntoken = {\"access_token\":\"tok\"}\n");
+
+        Backend b(dir.path() + "/state", dir.path() + "/mnt");
+        b.setRcloneConfigPath(cfgPath);
+        QVERIFY(b.connectRcloneRemote("gdrive"));
+        QTRY_VERIFY_WITH_TIMEOUT(!b.syncing(), 4000);
+
+        int err = 0;
+        QVERIFY(b.fuseMount()->handleReaddir("/Week15", &err).isEmpty());
+        QCOMPARE(err, 0);
+
+        write(remoteAdded, "1");
+        b.refreshRecentDirs();
+        QTRY_COMPARE_WITH_TIMEOUT(b.entryForPath("Week15/Test image.png").name, QString("Test image.png"), 4000);
+        QVERIFY(b.accessFile("Week15/Test image.png"));
+
+        QFile logF(argLog);
+        QVERIFY(logF.open(QIODevice::ReadOnly));
+        const QString logText = QString::fromUtf8(logF.readAll());
+        QVERIFY(logText.contains("--drive-export-formats=docx,xlsx,pptx,svg,png,jpg,pdf,txt"));
+    }
+
 private:
     static void write(const QString &path, const QByteArray &contents)
     {
